@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 )
 
+// loggingTransport intercepts each request/response pair
 type loggingTransport struct {
 	wrapped http.RoundTripper
 }
@@ -16,12 +18,14 @@ type loggingTransport struct {
 func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 
+	// Read and restore request body
 	var bodyBytes []byte
 	if req.Body != nil {
 		bodyBytes, _ = io.ReadAll(req.Body)
 		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 	}
 
+	// Collect headers
 	headers := map[string]string{}
 	for k, v := range req.Header {
 		if len(v) > 0 {
@@ -34,13 +38,31 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return resp, err
 	}
 
+	// Read and restore response body
+	var respBodyBytes []byte
+	if resp.Body != nil {
+		respBodyBytes, _ = io.ReadAll(resp.Body)
+		resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
+	}
+
+	// Collect response headers
+	respHeaders := map[string]string{}
+	for k, v := range resp.Header {
+		if len(v) > 0 {
+			respHeaders[k] = v[0]
+		}
+	}
+
 	EventChannel <- Event{
-		Method:     req.Method,
-		URL:        req.URL.Path,
-		Status:     resp.StatusCode,
-		LatencyMs:  time.Since(start).Milliseconds(),
-		ReqBody:    string(bodyBytes),
-		ReqHeaders: headers,
+		Method:      req.Method,
+		URL:         req.URL.Path,
+		FullURL:     req.URL.RequestURI(),
+		Status:      resp.StatusCode,
+		LatencyMs:   time.Since(start).Milliseconds(),
+		ReqBody:     string(bodyBytes),
+		ReqHeaders:  headers,
+		RespBody:    string(respBodyBytes),
+		RespHeaders: respHeaders,
 	}
 
 	return resp, nil
@@ -58,4 +80,32 @@ func Start(target string) {
 	})
 
 	http.ListenAndServe(":3000", nil)
+}
+
+// Replay sends a modified request back through the proxy (so it gets logged as a new event)
+func Replay(e Event, newBody string) error {
+	target := "http://localhost:3000" + e.FullURL
+	req, err := http.NewRequest(e.Method, target, strings.NewReader(newBody))
+	if err != nil {
+		return err
+	}
+
+	// Copy original headers — skip headers that Go computes automatically
+	skip := map[string]bool{
+		"content-length":    true,
+		"transfer-encoding": true,
+		"host":              true,
+	}
+	for k, v := range e.ReqHeaders {
+		if !skip[strings.ToLower(k)] {
+			req.Header.Set(k, v)
+		}
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
