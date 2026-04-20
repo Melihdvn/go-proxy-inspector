@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -68,18 +69,34 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-func Start(target string) {
-	remote, _ := url.Parse(target)
+// Start starts the proxy using a Config struct. It supports optional TLS when
+// TLSCertFile and TLSKeyFile are provided.
+func Start(cfg Config) {
+	remote, err := url.Parse(cfg.Target)
+	if err != nil {
+		log.Fatalf("proxy: invalid target URL %q: %v", cfg.Target, err)
+	}
 
-	proxy := httputil.NewSingleHostReverseProxy(remote)
-	proxy.Transport = &loggingTransport{wrapped: http.DefaultTransport}
+	p := httputil.NewSingleHostReverseProxy(remote)
+	p.Transport = &loggingTransport{wrapped: http.DefaultTransport}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		r.Host = remote.Host
-		proxy.ServeHTTP(w, r)
+		p.ServeHTTP(w, r)
 	})
 
-	http.ListenAndServe(":3000", nil)
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		log.Printf("proxy: listening (TLS) on %s → %s", cfg.ListenAddr, cfg.Target)
+		if err := http.ListenAndServeTLS(cfg.ListenAddr, cfg.TLSCertFile, cfg.TLSKeyFile, mux); err != nil {
+			log.Fatalf("proxy: %v", err)
+		}
+	} else {
+		log.Printf("proxy: listening on %s → %s", cfg.ListenAddr, cfg.Target)
+		if err := http.ListenAndServe(cfg.ListenAddr, mux); err != nil {
+			log.Fatalf("proxy: %v", err)
+		}
+	}
 }
 
 // Replay sends a modified request back through the proxy (so it gets logged as a new event)

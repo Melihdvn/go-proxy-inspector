@@ -12,8 +12,10 @@ func main() {
 
 	fmt.Println("STARTING PROXY + UI")
 
+	cfg := proxy.DefaultConfig()
+
 	// start proxy
-	go proxy.Start("http://localhost:4001")
+	go proxy.Start(cfg)
 
 	// create UI program
 	p := tea.NewProgram(ui.NewModel(), tea.WithAltScreen())
