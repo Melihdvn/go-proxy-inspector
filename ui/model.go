@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -88,6 +90,9 @@ type model struct {
 	editBuf    []rune
 	editCursor int
 	replayMsg  string
+
+	// export feedback
+	exportMsg string
 }
 
 func NewModel() model {
@@ -162,6 +167,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+x":
 				m.filterBuf = ""
 				m.cursor = 0
+			case "x":
+				// Export all events to a JSON file
+				evs := m.events
+				go func() {
+					_, _ = proxy.ExportEvents(evs)
+				}()
+				if len(m.events) == 0 {
+					m.exportMsg = "⚠ No events to export"
+				} else {
+					m.exportMsg = fmt.Sprintf("✓ Exporting %d events…", len(m.events))
+				}
 			}
 
 		// ── Detail screen ─────────────────────────────────────────────
@@ -276,6 +292,11 @@ func (m model) listView() string {
 	sb.WriteString(styleTitle.Render("HTTP Proxy Inspector") + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
+	// Export feedback
+	if m.exportMsg != "" {
+		sb.WriteString(styleOK.Render(m.exportMsg) + "\n")
+	}
+
 	// Filter bar
 	if m.filterMode {
 		sb.WriteString(styleFilter.Render("/ Filter: "+m.filterBuf+"█") + "\n")
@@ -343,7 +364,7 @@ func (m model) listView() string {
 	}
 
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
-	sb.WriteString(styleDim.Render("q:quit  ↑/k ↓/j:navigate  enter:detail  /:filter  ctrl+x:clear") + "\n")
+	sb.WriteString(styleDim.Render("q:quit  ↑/k ↓/j:navigate  enter:detail  /:filter  ctrl+x:clear  x:export") + "\n")
 	return sb.String()
 }
 
@@ -431,7 +452,7 @@ func buildDetailLines(e proxy.Event) []string {
 	if body == "" {
 		lines = append(lines, styleDim.Render("  (empty)"))
 	} else {
-		for _, l := range strings.Split(body, "\n") {
+		for _, l := range strings.Split(prettyJSON(body), "\n") {
 			lines = append(lines, "  "+l)
 		}
 	}
@@ -460,12 +481,21 @@ func buildDetailLines(e proxy.Event) []string {
 	if respBody == "" {
 		lines = append(lines, styleDim.Render("  (empty)"))
 	} else {
-		for _, l := range strings.Split(respBody, "\n") {
+		for _, l := range strings.Split(prettyJSON(respBody), "\n") {
 			lines = append(lines, "  "+l)
 		}
 	}
 
 	return lines
+}
+
+// prettyJSON attempts to pretty-print a JSON string; returns the original on failure.
+func prettyJSON(s string) string {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(s), "", "  "); err != nil {
+		return s
+	}
+	return buf.String()
 }
 
 // ── Edit screen ───────────────────────────────────────────────────────────────
