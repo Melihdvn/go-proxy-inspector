@@ -2,107 +2,138 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"strings"
 	"time"
+
+	"github.com/elazarl/goproxy"
 )
 
-// loggingTransport intercepts each request/response pair
-type loggingTransport struct {
-	wrapped http.RoundTripper
-}
-
-func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	start := time.Now()
-
-	// Read and restore request body
-	var bodyBytes []byte
-	if req.Body != nil {
-		bodyBytes, _ = io.ReadAll(req.Body)
-		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	}
-
-	// Collect headers
-	headers := map[string]string{}
-	for k, v := range req.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
-
-	resp, err := t.wrapped.RoundTrip(req)
-	if err != nil {
-		return resp, err
-	}
-
-	// Read and restore response body
-	var respBodyBytes []byte
-	if resp.Body != nil {
-		respBodyBytes, _ = io.ReadAll(resp.Body)
-		resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
-	}
-
-	// Collect response headers
-	respHeaders := map[string]string{}
-	for k, v := range resp.Header {
-		if len(v) > 0 {
-			respHeaders[k] = v[0]
-		}
-	}
-
-	EventChannel <- Event{
-		Method:      req.Method,
-		URL:         req.URL.Path,
-		FullURL:     req.URL.RequestURI(),
-		Status:      resp.StatusCode,
-		LatencyMs:   time.Since(start).Milliseconds(),
-		ReqBody:     string(bodyBytes),
-		ReqHeaders:  headers,
-		RespBody:    string(respBodyBytes),
-		RespHeaders: respHeaders,
-	}
-
-	return resp, nil
-}
-
-// Start starts the proxy using a Config struct. It supports optional TLS when
-// TLSCertFile and TLSKeyFile are provided.
+// Start starts the proxy using a Config struct.
 func Start(cfg Config) {
-	remote, err := url.Parse(cfg.Target)
-	if err != nil {
-		log.Fatalf("proxy: invalid target URL %q: %v", cfg.Target, err)
+	p := goproxy.NewProxyHttpServer()
+	p.Verbose = false // We'll do our own logging
+
+	// Set up MITM certificates if provided
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			log.Fatalf("proxy: failed to load CA cert/key: %v", err)
+		}
+		
+		// Configure goproxy's MITM CA
+		goproxy.GoproxyCa = cert
+		goproxy.OkConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
+		goproxy.MitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
+		goproxy.HTTPMitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectHTTPMitm, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
+		goproxy.RejectConnect = &goproxy.ConnectAction{Action: goproxy.ConnectReject, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
+
+		// Tell goproxy to always MITM HTTPS connections
+		p.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+		log.Printf("proxy: MITM enabled with CA %s", cfg.TLSCertFile)
 	}
 
-	p := httputil.NewSingleHostReverseProxy(remote)
-	p.Transport = &loggingTransport{wrapped: http.DefaultTransport}
+	// We use this struct to pass data between OnRequest and OnResponse
+	type requestData struct {
+		start     time.Time
+		bodyBytes []byte
+	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		r.Host = remote.Host
-		p.ServeHTTP(w, r)
-	})
+	// Intercept requests
+	p.OnRequest().DoFunc(
+		func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+			// Read request body to log it, then restore it
+			var bodyBytes []byte
+			if req.Body != nil {
+				bodyBytes, _ = io.ReadAll(req.Body)
+				req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			}
 
-	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-		log.Printf("proxy: listening (TLS) on %s → %s", cfg.ListenAddr, cfg.Target)
-		if err := http.ListenAndServeTLS(cfg.ListenAddr, cfg.TLSCertFile, cfg.TLSKeyFile, mux); err != nil {
-			log.Fatalf("proxy: %v", err)
-		}
-	} else {
-		log.Printf("proxy: listening on %s → %s", cfg.ListenAddr, cfg.Target)
-		if err := http.ListenAndServe(cfg.ListenAddr, mux); err != nil {
-			log.Fatalf("proxy: %v", err)
-		}
+			// Store req body and start time in UserData
+			ctx.UserData = requestData{
+				start:     time.Now(),
+				bodyBytes: bodyBytes,
+			}
+
+			return req, nil
+		})
+
+	// Intercept responses
+	p.OnResponse().DoFunc(
+		func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+			if resp == nil || ctx.Req == nil {
+				return resp
+			}
+
+			req := ctx.Req
+			var start time.Time
+			var reqBodyBytes []byte
+
+			if rd, ok := ctx.UserData.(requestData); ok {
+				start = rd.start
+				reqBodyBytes = rd.bodyBytes
+			} else {
+				start = time.Now()
+			}
+
+			// Read response body to log it, then restore it
+			var respBodyBytes []byte
+			if resp.Body != nil {
+				respBodyBytes, _ = io.ReadAll(resp.Body)
+				resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
+			}
+
+			// Collect request headers
+			reqHeaders := map[string]string{}
+			for k, v := range req.Header {
+				if len(v) > 0 {
+					reqHeaders[k] = v[0]
+				}
+			}
+
+			// Collect response headers
+			respHeaders := map[string]string{}
+			for k, v := range resp.Header {
+				if len(v) > 0 {
+					respHeaders[k] = v[0]
+				}
+			}
+
+			scheme := "http"
+			if req.URL.Scheme != "" {
+				scheme = req.URL.Scheme
+			} else if req.TLS != nil || req.URL.Port() == "443" {
+				scheme = "https"
+			}
+			fullURL := scheme + "://" + req.Host + req.URL.RequestURI()
+
+			EventChannel <- Event{
+				Method:      req.Method,
+				URL:         req.URL.Path,
+				FullURL:     fullURL,
+				Status:      resp.StatusCode,
+				LatencyMs:   time.Since(start).Milliseconds(),
+				ReqBody:     string(reqBodyBytes),
+				ReqHeaders:  reqHeaders,
+				RespBody:    string(respBodyBytes),
+				RespHeaders: respHeaders,
+			}
+
+			return resp
+		})
+
+	log.Printf("proxy: listening on %s", cfg.ListenAddr)
+	if err := http.ListenAndServe(cfg.ListenAddr, p); err != nil {
+		log.Fatalf("proxy: %v", err)
 	}
 }
 
-// Replay sends a modified request back through the proxy (so it gets logged as a new event)
+// Replay sends a modified request back out
 func Replay(e Event, newBody string) error {
-	target := "http://localhost:3000" + e.FullURL
-	req, err := http.NewRequest(e.Method, target, strings.NewReader(newBody))
+	req, err := http.NewRequest(e.Method, e.FullURL, strings.NewReader(newBody))
 	if err != nil {
 		return err
 	}
@@ -111,7 +142,6 @@ func Replay(e Event, newBody string) error {
 	skip := map[string]bool{
 		"content-length":    true,
 		"transfer-encoding": true,
-		"host":              true,
 	}
 	for k, v := range e.ReqHeaders {
 		if !skip[strings.ToLower(k)] {
@@ -119,7 +149,14 @@ func Replay(e Event, newBody string) error {
 		}
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	// We use default client for replays
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Allow self-signed for replay
+		},
+	}
+	
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}

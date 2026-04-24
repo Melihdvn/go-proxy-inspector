@@ -246,9 +246,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append([]rune{'\n'}, m.editBuf[m.editCursor:]...)...)
 				m.editCursor++
 			default:
-				if len(msg.Runes) > 0 {
-					m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append(msg.Runes, m.editBuf[m.editCursor:]...)...)
-					m.editCursor += len(msg.Runes)
+				if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+					if len(msg.Runes) > 0 {
+						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append(msg.Runes, m.editBuf[m.editCursor:]...)...)
+						m.editCursor += len(msg.Runes)
+					}
 				}
 			}
 		}

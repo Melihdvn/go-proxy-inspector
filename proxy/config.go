@@ -5,11 +5,8 @@ type Config struct {
 	// ListenAddr is the address the proxy listens on (e.g. ":3000").
 	ListenAddr string
 
-	// Target is the upstream server URL (e.g. "http://localhost:4001").
-	Target string
-
-	// TLSCertFile and TLSKeyFile enable HTTPS on the proxy listener when both
-	// are non-empty.
+	// TLSCertFile and TLSKeyFile enable HTTPS MITM interception when both
+	// are non-empty. These should be the CA certificate and key.
 	TLSCertFile string
 	TLSKeyFile  string
 }
@@ -18,6 +15,5 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		ListenAddr: ":3000",
-		Target:     "http://localhost:4001",
 	}
 }

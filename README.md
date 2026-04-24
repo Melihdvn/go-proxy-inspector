@@ -1,22 +1,19 @@
 # go-proxy-inspector
 
-A terminal-based HTTP proxy inspector built with Go and [Bubble Tea](https://github.com/charmbracelet/bubbletea).
+A terminal-based **Intercepting Forward Proxy** (like Charles Proxy or Fiddler) built with Go and [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 
-Sit between your HTTP client and your API, inspect every request and response in real time, edit request bodies, and replay them — all from the terminal.
-
-```
-Client → :3000 (proxy) → :4001 (your API)
-```
+Sit between your OS/Browser and the internet, inspect every HTTP/HTTPS request and response in real time, edit request bodies, and replay them — all from the terminal.
 
 ---
 
 ## Features
 
-- **Live request list** — see every proxied request as it happens
-- **Detail view** — inspect request headers, request body, response headers, and response body
-- **Edit & replay** — modify the request body and resend it; the replayed request is logged as a new event
-- **Scrollable UI** — navigate large payloads comfortably
-- No external dependencies beyond Bubble Tea
+- **Forward Proxy Architecture** — Intercepts all traffic routed through it (HTTP and HTTPS).
+- **HTTPS MITM Support** — Dynamically generates certificates to decrypt and inspect HTTPS traffic.
+- **Live request list** — see every proxied request as it happens.
+- **Detail view** — inspect request headers, request body, response headers, and response body.
+- **Edit & replay** — modify the request body and resend it to the original target.
+- **Scrollable UI** — navigate large payloads comfortably.
 
 ---
 
@@ -25,37 +22,47 @@ Client → :3000 (proxy) → :4001 (your API)
 ### Prerequisites
 
 - Go 1.21+
+- [mkcert](https://github.com/FiloSottile/mkcert) (Required for HTTPS MITM interception)
 
-### Install & Run
+### Installation & Certificate Setup
 
-```bash
-git clone https://github.com/Melihdvn/go-proxy-inspector
-cd go-proxy-inspector
-go run main.go
-```
+To intercept HTTPS traffic (like `https://google.com` or `https://api.github.com`), the proxy needs a trusted Certificate Authority (CA) to dynamically generate certificates. 
 
-By default the proxy listens on **`:3000`** and forwards to **`http://localhost:4001`**.  
-To change the target, edit `main.go`:
+1. **Install mkcert and local CA:**
+   ```bash
+   # Windows (winget/choco)
+   winget install FiloSottile.mkcert
+   mkcert -install
+   ```
 
-```go
-go proxy.Start("http://localhost:YOUR_PORT")
-```
+2. **Run the application:**
+   The application will automatically detect your `mkcert` Root CA in your system's AppData folder and enable HTTPS MITM interception.
+   ```bash
+   go run .
+   ```
 
 ---
 
 ## Usage
 
-Send requests to the proxy instead of your API directly:
+By default the proxy listens on **`localhost:3000`**.
 
+### 1. Test via cURL
+You can explicitly tell cURL to use your proxy:
 ```bash
-# Instead of: curl http://localhost:4001/test
-curl http://localhost:3000/test
+# HTTP Request
+curl -x http://localhost:3000 http://httpbin.org/get
 
-# With a JSON body
-curl -X POST http://localhost:3000/test \
-  -H "Content-Type: application/json" \
-  -d '{"message":"hello"}'
+# HTTPS Request
+curl -x http://localhost:3000 https://httpbin.org/get
 ```
+
+### 2. System-wide / Browser Interception
+To capture all your browser or system traffic:
+- **Windows:** Go to Settings -> Network & Internet -> Proxy. Set "Use a proxy server" to `On`, Address: `127.0.0.1`, Port: `3000`.
+- **Postman/Insomnia:** Configure the HTTP/HTTPS proxy in the app's settings to `127.0.0.1:3000`.
+
+*Note: Make sure you have run `mkcert -install` so your browser trusts the proxy's certificates.*
 
 ---
 
@@ -96,23 +103,14 @@ curl -X POST http://localhost:3000/test \
 
 ```
 go-proxy-inspector/
-├── main.go          # Entry point — wires proxy and UI together
+├── main.go          # Entry point — auto-detects certs and wires proxy to UI
 ├── proxy/
-│   ├── proxy.go     # Reverse proxy with custom RoundTripper for inspection
+│   ├── config.go    # Proxy configuration (ListenAddr, Certs)
+│   ├── proxy.go     # Forward Proxy server using elazarl/goproxy
 │   └── event.go     # Event struct and channel
 └── ui/
     └── model.go     # Bubble Tea model — list, detail, and edit screens
 ```
-
----
-
-## How it Works
-
-1. `proxy.Start()` spins up an `httputil.ReverseProxy` on `:3000` with a custom `RoundTripper`
-2. For every request, the `RoundTripper` reads and restores both the request and response bodies, then sends an `Event` over a buffered channel
-3. `main.go` bridges the channel to Bubble Tea via `p.Send(event)`
-4. The UI updates in real time across three screens: **List → Detail → Edit**
-5. Replay sends a new request back through `:3000`, so it is captured and logged as a fresh event
 
 ---
 
