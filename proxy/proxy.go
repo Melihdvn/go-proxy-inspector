@@ -14,8 +14,13 @@ import (
 
 // Start starts the proxy using a Config struct.
 func Start(cfg Config) {
+	// Seed blocklist from config
+	for _, d := range cfg.BlockedDomains {
+		AddToBlocklist(d)
+	}
+
 	p := goproxy.NewProxyHttpServer()
-	p.Verbose = false // We'll do our own logging
+	p.Verbose = false
 
 	// Set up MITM certificates if provided
 	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
@@ -23,20 +28,15 @@ func Start(cfg Config) {
 		if err != nil {
 			log.Fatalf("proxy: failed to load CA cert/key: %v", err)
 		}
-		
-		// Configure goproxy's MITM CA
 		goproxy.GoproxyCa = cert
 		goproxy.OkConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
 		goproxy.MitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
 		goproxy.HTTPMitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectHTTPMitm, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
 		goproxy.RejectConnect = &goproxy.ConnectAction{Action: goproxy.ConnectReject, TLSConfig: goproxy.TLSConfigFromCA(&cert)}
-
-		// Tell goproxy to always MITM HTTPS connections
 		p.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 		log.Printf("proxy: MITM enabled with CA %s", cfg.TLSCertFile)
 	}
 
-	// We use this struct to pass data between OnRequest and OnResponse
 	type requestData struct {
 		start     time.Time
 		bodyBytes []byte
@@ -45,19 +45,66 @@ func Start(cfg Config) {
 	// Intercept requests
 	p.OnRequest().DoFunc(
 		func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-			// Read request body to log it, then restore it
 			var bodyBytes []byte
 			if req.Body != nil {
 				bodyBytes, _ = io.ReadAll(req.Body)
 				req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			}
 
-			// Store req body and start time in UserData
-			ctx.UserData = requestData{
-				start:     time.Now(),
-				bodyBytes: bodyBytes,
+			// ── Blocklist check ───────────────────────────────────────
+			if IsBlocked(req.Host) {
+				blocked := Event{
+					Timestamp:  time.Now(),
+					Method:     req.Method,
+					Host:       req.Host,
+					URL:        req.URL.Path,
+					FullURL:    buildFullURL(req),
+					Status:     0,
+					LatencyMs:  0,
+					ReqBody:    string(bodyBytes),
+					ReqHeaders: collectHeaders(req.Header),
+					Blocked:    true,
+				}
+				EventChannel <- blocked
+				return req, goproxy.NewResponse(req, goproxy.ContentTypeText,
+					http.StatusForbidden, "Blocked by go-proxy-inspector")
 			}
 
+			// ── Intercept mode ────────────────────────────────────────
+			if IsInterceptEnabled() {
+				reqHeaders := collectHeaders(req.Header)
+				decChan := make(chan InterceptDecision, 1)
+				ir := InterceptRequest{
+					Event: Event{
+						Timestamp:  time.Now(),
+						Method:     req.Method,
+						Host:       req.Host,
+						URL:        req.URL.Path,
+						FullURL:    buildFullURL(req),
+						ReqBody:    string(bodyBytes),
+						ReqHeaders: reqHeaders,
+					},
+					Decision: decChan,
+				}
+				// Non-blocking send; if UI isn't ready, skip intercept
+				select {
+				case InterceptChan <- ir:
+					dec := <-decChan
+					if dec.Action == "drop" {
+						return req, goproxy.NewResponse(req, goproxy.ContentTypeText,
+							http.StatusBadGateway, "Dropped by intercept")
+					}
+					if dec.NewBody != "" {
+						bodyBytes = []byte(dec.NewBody)
+						req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+						req.ContentLength = int64(len(bodyBytes))
+					}
+				default:
+					// channel full, let request pass through
+				}
+			}
+
+			ctx.UserData = requestData{start: time.Now(), bodyBytes: bodyBytes}
 			return req, nil
 		})
 
@@ -79,47 +126,24 @@ func Start(cfg Config) {
 				start = time.Now()
 			}
 
-			// Read response body to log it, then restore it
 			var respBodyBytes []byte
 			if resp.Body != nil {
 				respBodyBytes, _ = io.ReadAll(resp.Body)
 				resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
 			}
 
-			// Collect request headers
-			reqHeaders := map[string]string{}
-			for k, v := range req.Header {
-				if len(v) > 0 {
-					reqHeaders[k] = v[0]
-				}
-			}
-
-			// Collect response headers
-			respHeaders := map[string]string{}
-			for k, v := range resp.Header {
-				if len(v) > 0 {
-					respHeaders[k] = v[0]
-				}
-			}
-
-			scheme := "http"
-			if req.URL.Scheme != "" {
-				scheme = req.URL.Scheme
-			} else if req.TLS != nil || req.URL.Port() == "443" {
-				scheme = "https"
-			}
-			fullURL := scheme + "://" + req.Host + req.URL.RequestURI()
-
 			EventChannel <- Event{
+				Timestamp:   start,
 				Method:      req.Method,
+				Host:        req.Host,
 				URL:         req.URL.Path,
-				FullURL:     fullURL,
+				FullURL:     buildFullURL(req),
 				Status:      resp.StatusCode,
 				LatencyMs:   time.Since(start).Milliseconds(),
 				ReqBody:     string(reqBodyBytes),
-				ReqHeaders:  reqHeaders,
+				ReqHeaders:  collectHeaders(req.Header),
 				RespBody:    string(respBodyBytes),
-				RespHeaders: respHeaders,
+				RespHeaders: collectHeaders(resp.Header),
 			}
 
 			return resp
@@ -131,31 +155,45 @@ func Start(cfg Config) {
 	}
 }
 
-// Replay sends a modified request back out
+// buildFullURL constructs the full URL from a request.
+func buildFullURL(req *http.Request) string {
+	scheme := "http"
+	if req.URL.Scheme != "" {
+		scheme = req.URL.Scheme
+	} else if req.TLS != nil || req.URL.Port() == "443" {
+		scheme = "https"
+	}
+	return scheme + "://" + req.Host + req.URL.RequestURI()
+}
+
+// collectHeaders copies headers into a flat map (first value only).
+func collectHeaders(h http.Header) map[string]string {
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		if len(v) > 0 {
+			out[k] = v[0]
+		}
+	}
+	return out
+}
+
+// Replay sends a modified request back out (fire-and-forget).
 func Replay(e Event, newBody string) error {
 	req, err := http.NewRequest(e.Method, e.FullURL, strings.NewReader(newBody))
 	if err != nil {
 		return err
 	}
-
-	// Copy original headers — skip headers that Go computes automatically
-	skip := map[string]bool{
-		"content-length":    true,
-		"transfer-encoding": true,
-	}
+	skip := map[string]bool{"content-length": true, "transfer-encoding": true}
 	for k, v := range e.ReqHeaders {
 		if !skip[strings.ToLower(k)] {
 			req.Header.Set(k, v)
 		}
 	}
-
-	// We use default client for replays
 	client := &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Allow self-signed for replay
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
