@@ -4,16 +4,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"proxy-inspector/proxy"
 
-	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-// ── Lipgloss styles ───────────────────────────────────────────────────────────
+// ── Styles ────────────────────────────────────────────────────────────────────
 
 var (
 	styleGET    = lipgloss.NewStyle().Foreground(lipgloss.Color("#00E599")).Bold(true)
@@ -28,10 +30,12 @@ var (
 	styleWarn  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00"))
 	styleErr   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF4D4D"))
 
-	styleTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#00E599")).Bold(true)
-	styleCursor = lipgloss.NewStyle().Bold(true).Reverse(true)
-	styleFilter = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFB800"))
-	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("#555555"))
+	styleTitle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#00E599")).Bold(true)
+	styleIntercept = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF4D4D")).Bold(true).Reverse(true)
+	styleCursor    = lipgloss.NewStyle().Bold(true).Reverse(true)
+	styleFilter    = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFB800"))
+	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("#555555"))
+	styleBlocked   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Strikethrough(true)
 )
 
 func methodStyle(m string) lipgloss.Style {
@@ -53,6 +57,8 @@ func methodStyle(m string) lipgloss.Style {
 
 func statusStyle(code int) lipgloss.Style {
 	switch {
+	case code == 0:
+		return styleDim
 	case code >= 500:
 		return styleErr
 	case code >= 400:
@@ -69,9 +75,14 @@ func statusStyle(code int) lipgloss.Style {
 type screen int
 
 const (
-	listScreen   screen = iota
+	listScreen screen = iota
 	detailScreen
 	editScreen
+	interceptScreen
+	replayResultScreen
+	blocklistScreen
+	statsScreen
+	helpScreen
 )
 
 type model struct {
@@ -82,35 +93,72 @@ type model struct {
 	screen       screen
 	detailScroll int
 
-	// filter
 	filterMode bool
 	filterBuf  string
 
-	// edit mode
 	editBuf    []rune
 	editCursor int
 	replayMsg  string
 
-	// export feedback
 	exportMsg string
+
+	// intercept state
+	pendingIntercept *proxy.InterceptRequest
+	interceptScroll  int
+
+	// replay response state
+	replayResult *proxy.Event
 }
 
 func NewModel() model {
 	return model{events: []proxy.Event{}}
 }
 
-func (m model) Init() tea.Cmd { return nil }
+func (m model) Init() tea.Cmd {
+	return checkIntercepts
+}
 
-// filteredEvents returns events matching the current filter query.
+// checkIntercepts polls the InterceptChan without blocking
+func checkIntercepts() tea.Msg {
+	select {
+	case ir := <-proxy.InterceptChan:
+		return ir
+	case <-time.After(100 * time.Millisecond):
+		return struct{}{} // tick
+	}
+}
+
 func (m model) filteredEvents() []proxy.Event {
 	if m.filterBuf == "" {
 		return m.events
 	}
-	q := strings.ToLower(m.filterBuf)
 	out := make([]proxy.Event, 0, len(m.events))
+	
+	// Regex check
+	var re *regexp.Regexp
+	if strings.HasPrefix(m.filterBuf, "regex:") {
+		var err error
+		re, err = regexp.Compile("(?i)" + strings.TrimPrefix(m.filterBuf, "regex:"))
+		if err != nil {
+			re = nil // fallback to no match if invalid
+		}
+	}
+
+	q := strings.ToLower(m.filterBuf)
 	for _, e := range m.events {
-		if strings.Contains(strings.ToLower(e.URL), q) ||
-			strings.Contains(strings.ToLower(e.Method), q) {
+		match := false
+		if re != nil {
+			match = re.MatchString(e.FullURL) || re.MatchString(e.Method)
+		} else if strings.HasPrefix(q, "method:") {
+			match = strings.ToLower(e.Method) == strings.TrimPrefix(q, "method:")
+		} else if strings.HasPrefix(q, "host:") {
+			match = strings.Contains(strings.ToLower(e.Host), strings.TrimPrefix(q, "host:"))
+		} else if strings.HasPrefix(q, "status:") {
+			match = fmt.Sprintf("%d", e.Status) == strings.TrimPrefix(q, "status:")
+		} else {
+			match = strings.Contains(strings.ToLower(e.FullURL), q) || strings.Contains(strings.ToLower(e.Method), q)
+		}
+		if match {
 			out = append(out, e)
 		}
 	}
@@ -119,14 +167,45 @@ func (m model) filteredEvents() []proxy.Event {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 
+	case proxy.Event:
+		m.events = append([]proxy.Event{msg}, m.events...)
+		if m.screen == listScreen && !m.filterMode {
+			m.cursor++
+			vis := m.filteredEvents()
+			if m.cursor >= len(vis) {
+				m.cursor = len(vis) - 1
+			}
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+		}
+		// cap events to a hard limit to prevent OOM
+		if len(m.events) > 1000 {
+			m.events = m.events[:1000]
+		}
+
+	case proxy.InterceptRequest:
+		if m.pendingIntercept == nil {
+			ir := msg
+			m.pendingIntercept = &ir
+			m.screen = interceptScreen
+			m.editBuf = []rune(ir.Event.ReqBody)
+			m.editCursor = len(m.editBuf)
+		} else {
+			// drop if we are already intercepting something else
+			msg.Decision <- proxy.InterceptDecision{Action: "forward"}
+		}
+		return m, checkIntercepts
+
+	case struct{}:
+		return m, checkIntercepts
+
 	case tea.KeyMsg:
 		switch m.screen {
-
 		// ── List screen ───────────────────────────────────────────────
 		case listScreen:
 			if m.filterMode {
@@ -148,6 +227,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "q", "ctrl+c":
 				return m, tea.Quit
+			case "?":
+				m.screen = helpScreen
 			case "up", "k":
 				if m.cursor > 0 {
 					m.cursor--
@@ -168,16 +249,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.filterBuf = ""
 				m.cursor = 0
 			case "x":
-				// Export all events to a JSON file
+				// JSON Export
 				evs := m.events
-				go func() {
-					_, _ = proxy.ExportEvents(evs)
-				}()
-				if len(m.events) == 0 {
-					m.exportMsg = "⚠ No events to export"
+				go func() { proxy.ExportEvents(evs) }()
+				m.exportMsg = fmt.Sprintf("✓ Exported %d events to JSON", len(m.events))
+			case "h":
+				// HAR Export
+				evs := m.events
+				go func() { proxy.ExportHAR(evs) }()
+				m.exportMsg = fmt.Sprintf("✓ Exported %d events to HAR", len(m.events))
+			case "i":
+				proxy.SetInterceptMode(!proxy.IsInterceptEnabled())
+				if proxy.IsInterceptEnabled() {
+					m.exportMsg = "⚠ Intercept mode ON"
 				} else {
-					m.exportMsg = fmt.Sprintf("✓ Exporting %d events…", len(m.events))
+					m.exportMsg = "✓ Intercept mode OFF"
 				}
+			case "r":
+				// Quick replay
+				vis := m.filteredEvents()
+				if m.cursor < len(vis) {
+					e := vis[m.cursor]
+					go func() {
+						res, err := proxy.ReplayWithResponse(e, e.ReqBody)
+						if err == nil {
+							proxy.EventChannel <- res
+						}
+					}()
+					m.exportMsg = "↺ Replaying request..."
+				}
+			case "b":
+				vis := m.filteredEvents()
+				if m.cursor < len(vis) {
+					e := vis[m.cursor]
+					proxy.AddToBlocklist(e.Host)
+					m.exportMsg = "⚠ Blocked host: " + e.Host
+				}
+			case "B":
+				m.screen = blocklistScreen
+			case "S":
+				m.screen = statsScreen
 			}
 
 		// ── Detail screen ─────────────────────────────────────────────
@@ -214,13 +325,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				body := string(m.editBuf)
 				vis := m.filteredEvents()
 				e := vis[m.cursor]
-				go func() {
-					if err := proxy.Replay(e, body); err != nil {
-						_ = err
-					}
-				}()
-				m.screen = detailScreen
-				m.replayMsg = "↺ Replayed! (check list for new event)"
+				m.exportMsg = "↺ Sending replay..."
+				// Blocking replay so we can show result immediately (in real app, use tea.Cmd)
+				res, err := proxy.ReplayWithResponse(e, body)
+				if err == nil {
+					m.replayResult = &res
+					m.screen = replayResultScreen
+					m.detailScroll = 0
+					proxy.EventChannel <- res // add to list too
+				} else {
+					m.screen = detailScreen
+					m.replayMsg = "⚠ Replay error: " + err.Error()
+				}
 			case "backspace":
 				if m.editCursor > 0 {
 					m.editBuf = append(m.editBuf[:m.editCursor-1:m.editCursor-1], m.editBuf[m.editCursor:]...)
@@ -238,10 +354,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.editCursor < len(m.editBuf) {
 					m.editCursor++
 				}
-			case "home", "ctrl+a":
-				m.editCursor = 0
-			case "end", "ctrl+e":
-				m.editCursor = len(m.editBuf)
 			case "enter":
 				m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append([]rune{'\n'}, m.editBuf[m.editCursor:]...)...)
 				m.editCursor++
@@ -253,22 +365,79 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
-		}
 
-	case proxy.Event:
-		m.events = append([]proxy.Event{msg}, m.events...)
-		if m.screen == listScreen && !m.filterMode {
-			m.cursor++
-			vis := m.filteredEvents()
-			if m.cursor >= len(vis) {
-				m.cursor = len(vis) - 1
+		// ── Intercept screen ──────────────────────────────────────────
+		case interceptScreen:
+			switch msg.String() {
+			case "ctrl+c":
+				if m.pendingIntercept != nil {
+					m.pendingIntercept.Decision <- proxy.InterceptDecision{Action: "drop"}
+				}
+				return m, tea.Quit
+			case "ctrl+f":
+				if m.pendingIntercept != nil {
+					m.pendingIntercept.Decision <- proxy.InterceptDecision{Action: "forward", NewBody: string(m.editBuf)}
+					m.pendingIntercept = nil
+				}
+				m.screen = listScreen
+			case "ctrl+d":
+				if m.pendingIntercept != nil {
+					m.pendingIntercept.Decision <- proxy.InterceptDecision{Action: "drop"}
+					m.pendingIntercept = nil
+				}
+				m.screen = listScreen
+			case "backspace":
+				if m.editCursor > 0 {
+					m.editBuf = append(m.editBuf[:m.editCursor-1:m.editCursor-1], m.editBuf[m.editCursor:]...)
+					m.editCursor--
+				}
+			case "delete":
+				if m.editCursor < len(m.editBuf) {
+					m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], m.editBuf[m.editCursor+1:]...)
+				}
+			case "left":
+				if m.editCursor > 0 {
+					m.editCursor--
+				}
+			case "right":
+				if m.editCursor < len(m.editBuf) {
+					m.editCursor++
+				}
+			case "enter":
+				m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append([]rune{'\n'}, m.editBuf[m.editCursor:]...)...)
+				m.editCursor++
+			default:
+				if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+					if len(msg.Runes) > 0 {
+						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append(msg.Runes, m.editBuf[m.editCursor:]...)...)
+						m.editCursor += len(msg.Runes)
+					}
+				}
 			}
-			if m.cursor < 0 {
-				m.cursor = 0
+
+		// ── Replay Result screen ──────────────────────────────────────
+		case replayResultScreen:
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "esc", "backspace":
+				m.screen = listScreen
+			case "up", "k":
+				if m.detailScroll > 0 {
+					m.detailScroll--
+				}
+			case "down", "j":
+				m.detailScroll++
 			}
-		}
-		if len(m.events) > 100 {
-			m.events = m.events[:100]
+
+		// ── Blocklist / Stats / Help screens ──────────────────────────
+		case blocklistScreen, statsScreen, helpScreen:
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "esc", "backspace":
+				m.screen = listScreen
+			}
 		}
 	}
 
@@ -281,25 +450,39 @@ func (m model) View() string {
 		return m.detailView()
 	case editScreen:
 		return m.editView()
+	case interceptScreen:
+		return m.interceptView()
+	case replayResultScreen:
+		return m.replayResultView()
+	case blocklistScreen:
+		return m.blocklistView()
+	case statsScreen:
+		return RenderStats(ComputeStats(m.events))
+	case helpScreen:
+		return m.helpView()
 	default:
 		return m.listView()
 	}
 }
 
-// ── List screen ───────────────────────────────────────────────────────────────
+// ── Views ─────────────────────────────────────────────────────────────────────
 
 func (m model) listView() string {
 	var sb strings.Builder
 
-	sb.WriteString(styleTitle.Render("HTTP Proxy Inspector") + "\n")
+	title := "HTTP Proxy Inspector"
+	if proxy.IsInterceptEnabled() {
+		title += " " + styleIntercept.Render("[INTERCEPT ON]")
+	}
+	title += fmt.Sprintf(" (%d requests)", len(m.events))
+
+	sb.WriteString(styleTitle.Render(title) + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
-	// Export feedback
 	if m.exportMsg != "" {
 		sb.WriteString(styleOK.Render(m.exportMsg) + "\n")
 	}
 
-	// Filter bar
 	if m.filterMode {
 		sb.WriteString(styleFilter.Render("/ Filter: "+m.filterBuf+"█") + "\n")
 	} else if m.filterBuf != "" {
@@ -309,34 +492,23 @@ func (m model) listView() string {
 	vis := m.filteredEvents()
 
 	if len(vis) == 0 {
-		if m.filterBuf != "" {
-			sb.WriteString(styleDim.Render("  No requests match the filter.\n"))
-		} else {
-			sb.WriteString(styleDim.Render("  No requests yet… Send a request to :3000\n"))
-		}
+		sb.WriteString(styleDim.Render("  No requests match or no requests yet...\n"))
 		sb.WriteString(strings.Repeat("─", 62) + "\n")
-		sb.WriteString(styleDim.Render("q:quit  ↑/k ↓/j:navigate  enter:detail  /:filter") + "\n")
+		sb.WriteString(styleDim.Render("?:help  q:quit  i:intercept") + "\n")
 		return sb.String()
 	}
 
 	extraLines := 0
-	if m.filterBuf != "" {
-		extraLines = 1
-	}
+	if m.filterBuf != "" { extraLines++ }
+	if m.exportMsg != "" { extraLines++ }
 	const fixedLines = 4
 	listHeight := m.height - fixedLines - extraLines
-	if listHeight < 2 {
-		listHeight = 2
-	}
+	if listHeight < 2 { listHeight = 2 }
 
 	start := 0
-	if m.cursor >= listHeight {
-		start = m.cursor - listHeight + 1
-	}
+	if m.cursor >= listHeight { start = m.cursor - listHeight + 1 }
 	end := start + listHeight
-	if end > len(vis) {
-		end = len(vis)
-	}
+	if end > len(vis) { end = len(vis) }
 
 	for i := start; i < end; i++ {
 		e := vis[i]
@@ -344,49 +516,47 @@ func (m model) listView() string {
 		sst := statusStyle(e.Status)
 
 		methodStr := fmt.Sprintf("%-6s", e.Method)
-		urlStr := fmt.Sprintf("%-32s", e.URL)
-		statusStr := fmt.Sprintf("%d", e.Status)
-		latStr := fmt.Sprintf("%dms", e.LatencyMs)
+		hostPath := e.Host + e.URL
+		if len(hostPath) > 38 {
+			hostPath = hostPath[:35] + "..."
+		}
+		urlStr := fmt.Sprintf("%-38s", hostPath)
+		statusStr := fmt.Sprintf("%3d", e.Status)
+		latStr := fmt.Sprintf("%4dms", e.LatencyMs)
+
+		if e.Blocked {
+			sst = styleBlocked
+			statusStr = "BLK"
+			latStr = "   -"
+		} else if e.Status == 0 {
+			statusStr = "---"
+		}
 
 		var line string
 		if i == m.cursor {
-			// Reversed highlight — plain text inside Reverse style
-			raw := fmt.Sprintf("> [%-6s] %-32s  %s  %s",
-				e.Method, e.URL, statusStr, latStr)
+			raw := fmt.Sprintf("> [%-6s] %-38s  %s  %s", e.Method, hostPath, statusStr, latStr)
 			line = styleCursor.Render(raw)
 		} else {
-			line = fmt.Sprintf("  [%s] %s  %s  %s",
-				mst.Render(methodStr),
-				urlStr,
-				sst.Render(statusStr),
-				styleDim.Render(latStr),
-			)
+			line = fmt.Sprintf("  [%s] %s  %s  %s", mst.Render(methodStr), urlStr, sst.Render(statusStr), styleDim.Render(latStr))
 		}
 		sb.WriteString(line + "\n")
 	}
 
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
-	sb.WriteString(styleDim.Render("q:quit  ↑/k ↓/j:navigate  enter:detail  /:filter  ctrl+x:clear  x:export") + "\n")
+	sb.WriteString(styleDim.Render("?:help  q:quit  ↑/↓:nav  enter:detail  /:filter  i:intercept") + "\n")
 	return sb.String()
 }
 
-// ── Detail screen ─────────────────────────────────────────────────────────────
-
 func (m model) detailView() string {
 	vis := m.filteredEvents()
-	if m.cursor >= len(vis) {
-		return "No event selected.\n"
-	}
+	if m.cursor >= len(vis) { return "No event selected.\n" }
 	e := vis[m.cursor]
+	
 	var sb strings.Builder
-
-	mst := methodStyle(e.Method)
-	sst := statusStyle(e.Status)
-	header := fmt.Sprintf("[ %s %s — %s — %dms ]",
-		mst.Render(e.Method),
-		e.URL,
-		sst.Render(fmt.Sprintf("%d", e.Status)),
-		e.LatencyMs,
+	header := fmt.Sprintf("[ %s %s — %s — %dms ] %s",
+		methodStyle(e.Method).Render(e.Method), e.FullURL,
+		statusStyle(e.Status).Render(fmt.Sprintf("%d", e.Status)),
+		e.LatencyMs, styleDim.Render(e.Timestamp.Format("15:04:05.000")),
 	)
 	sb.WriteString(header + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
@@ -396,121 +566,33 @@ func (m model) detailView() string {
 	}
 
 	lines := buildDetailLines(e)
-
-	const fixedLines = 4
-	viewHeight := m.height - fixedLines
-	if m.replayMsg != "" {
-		viewHeight--
-	}
-	if viewHeight < 2 {
-		viewHeight = 2
-	}
+	viewHeight := m.height - 4
+	if m.replayMsg != "" { viewHeight-- }
+	if viewHeight < 2 { viewHeight = 2 }
 
 	maxScroll := len(lines) - viewHeight
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
+	if maxScroll < 0 { maxScroll = 0 }
 	scroll := m.detailScroll
-	if scroll > maxScroll {
-		scroll = maxScroll
-	}
+	if scroll > maxScroll { scroll = maxScroll }
 	end := scroll + viewHeight
-	if end > len(lines) {
-		end = len(lines)
-	}
+	if end > len(lines) { end = len(lines) }
 
 	for _, l := range lines[scroll:end] {
 		sb.WriteString(l + "\n")
 	}
 
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
-	sb.WriteString(styleDim.Render("esc:back  e:edit&replay  ↑/k ↓/j:scroll") + "\n")
+	sb.WriteString(styleDim.Render("esc:back  e:edit  r:replay  b:block host  ↑/↓:scroll") + "\n")
 	return sb.String()
 }
 
-func buildDetailLines(e proxy.Event) []string {
-	var lines []string
-
-	lines = append(lines, styleGET.Render("── Request Headers ───────────────────────────────────"))
-	if len(e.ReqHeaders) == 0 {
-		lines = append(lines, styleDim.Render("  (none)"))
-	} else {
-		keys := make([]string, 0, len(e.ReqHeaders))
-		for k := range e.ReqHeaders {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			lines = append(lines, fmt.Sprintf("  %s %s",
-				styleDim.Render(fmt.Sprintf("%-30s", k+":")),
-				e.ReqHeaders[k],
-			))
-		}
-	}
-
-	lines = append(lines, "")
-	lines = append(lines, styleGET.Render("── Request Body ──────────────────────────────────────"))
-	body := strings.TrimSpace(e.ReqBody)
-	if body == "" {
-		lines = append(lines, styleDim.Render("  (empty)"))
-	} else {
-		for _, l := range strings.Split(prettyJSON(body), "\n") {
-			lines = append(lines, "  "+l)
-		}
-	}
-
-	lines = append(lines, "")
-	lines = append(lines, styleOK.Render("── Response Headers ──────────────────────────────────"))
-	if len(e.RespHeaders) == 0 {
-		lines = append(lines, styleDim.Render("  (none)"))
-	} else {
-		keys := make([]string, 0, len(e.RespHeaders))
-		for k := range e.RespHeaders {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			lines = append(lines, fmt.Sprintf("  %s %s",
-				styleDim.Render(fmt.Sprintf("%-30s", k+":")),
-				e.RespHeaders[k],
-			))
-		}
-	}
-
-	lines = append(lines, "")
-	lines = append(lines, styleOK.Render("── Response Body ─────────────────────────────────────"))
-	respBody := strings.TrimSpace(e.RespBody)
-	if respBody == "" {
-		lines = append(lines, styleDim.Render("  (empty)"))
-	} else {
-		for _, l := range strings.Split(prettyJSON(respBody), "\n") {
-			lines = append(lines, "  "+l)
-		}
-	}
-
-	return lines
-}
-
-// prettyJSON attempts to pretty-print a JSON string; returns the original on failure.
-func prettyJSON(s string) string {
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, []byte(s), "", "  "); err != nil {
-		return s
-	}
-	return buf.String()
-}
-
-// ── Edit screen ───────────────────────────────────────────────────────────────
-
 func (m model) editView() string {
 	vis := m.filteredEvents()
-	if m.cursor >= len(vis) {
-		return "No event selected.\n"
-	}
+	if m.cursor >= len(vis) { return "No event selected.\n" }
 	e := vis[m.cursor]
 	var sb strings.Builder
 
-	sb.WriteString(stylePUT.Render(fmt.Sprintf("EDIT  [ %s %s ]", e.Method, e.URL)) + "\n")
+	sb.WriteString(stylePUT.Render(fmt.Sprintf("EDIT  [ %s %s ]", e.Method, e.FullURL)) + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
 	before := string(m.editBuf[:m.editCursor])
@@ -522,6 +604,169 @@ func (m model) editView() string {
 	}
 
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
-	sb.WriteString(styleDim.Render("ctrl+s:replay  esc:cancel  ←→:cursor  home/end") + "\n")
+	sb.WriteString(styleDim.Render("ctrl+s:replay  esc:cancel  ←→:cursor") + "\n")
 	return sb.String()
+}
+
+func (m model) interceptView() string {
+	if m.pendingIntercept == nil {
+		return "No pending intercept.\n"
+	}
+	e := m.pendingIntercept.Event
+	var sb strings.Builder
+
+	sb.WriteString(styleIntercept.Render(fmt.Sprintf(" INTERCEPTED: %s %s ", e.Method, e.FullURL)) + "\n")
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+
+	before := string(m.editBuf[:m.editCursor])
+	after := string(m.editBuf[m.editCursor:])
+	bufferText := before + "█" + after
+
+	for _, l := range strings.Split(bufferText, "\n") {
+		sb.WriteString(l + "\n")
+	}
+
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+	sb.WriteString(styleDim.Render("ctrl+f:forward  ctrl+d:drop  ←→:edit body") + "\n")
+	return sb.String()
+}
+
+func (m model) replayResultView() string {
+	if m.replayResult == nil { return "" }
+	e := *m.replayResult
+	
+	var sb strings.Builder
+	sb.WriteString(styleTitle.Render("REPLAY RESULT") + "\n")
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+
+	lines := buildDetailLines(e)
+	viewHeight := m.height - 4
+	if viewHeight < 2 { viewHeight = 2 }
+
+	maxScroll := len(lines) - viewHeight
+	if maxScroll < 0 { maxScroll = 0 }
+	scroll := m.detailScroll
+	if scroll > maxScroll { scroll = maxScroll }
+	end := scroll + viewHeight
+	if end > len(lines) { end = len(lines) }
+
+	for _, l := range lines[scroll:end] {
+		sb.WriteString(l + "\n")
+	}
+
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+	sb.WriteString(styleDim.Render("esc:back  ↑/↓:scroll") + "\n")
+	return sb.String()
+}
+
+func (m model) blocklistView() string {
+	var sb strings.Builder
+	sb.WriteString(styleTitle.Render("Blocked Domains") + "\n")
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+
+	blocked := proxy.GetBlocklist().List()
+	if len(blocked) == 0 {
+		sb.WriteString(styleDim.Render("  No domains blocked.\n"))
+	} else {
+		for i, d := range blocked {
+			sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, styleErr.Render(d)))
+		}
+	}
+
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+	sb.WriteString(styleDim.Render("esc:back") + "\n")
+	return sb.String()
+}
+
+func (m model) helpView() string {
+	var sb strings.Builder
+	sb.WriteString(styleTitle.Render("Keyboard Shortcuts") + "\n")
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+	
+	help := `
+Global:
+  q, ctrl+c   Quit
+  ?           Show this help screen
+  esc         Back to previous screen
+
+List Screen:
+  ↑/k, ↓/j    Navigate requests
+  enter       View request details
+  /           Filter (e.g., host:api, method:POST, regex:^https)
+  ctrl+x      Clear filter
+  i           Toggle Intercept mode (Pause & Modify)
+  x           Export all events to JSON
+  h           Export all events to HAR (DevTools compatible)
+  r           Quick replay selected request
+  b           Block selected request's host
+  B           View Blocklist
+  S           View Statistics (Latency histogram, etc)
+
+Detail Screen:
+  ↑/k, ↓/j    Scroll headers and body
+  e           Edit request body
+  r           Quick replay
+
+Intercept Screen:
+  ctrl+f      Forward request (with modified body)
+  ctrl+d      Drop request
+`
+	sb.WriteString(help)
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+	sb.WriteString(styleDim.Render("esc:back") + "\n")
+	return sb.String()
+}
+
+func buildDetailLines(e proxy.Event) []string {
+	var lines []string
+
+	lines = append(lines, styleGET.Render("── Request Headers ───────────────────────────────────"))
+	for _, k := range sortedKeys(e.ReqHeaders) {
+		lines = append(lines, fmt.Sprintf("  %s %s", styleDim.Render(fmt.Sprintf("%-25s", k+":")), e.ReqHeaders[k]))
+	}
+
+	lines = append(lines, "", styleGET.Render("── Request Body ──────────────────────────────────────"))
+	if e.ReqBody == "" {
+		lines = append(lines, styleDim.Render("  (empty)"))
+	} else {
+		for _, l := range strings.Split(prettyJSON(e.ReqBody), "\n") {
+			lines = append(lines, "  "+l)
+		}
+	}
+
+	if e.Blocked {
+		lines = append(lines, "", styleErr.Render("── BLOCKED BY BLOCKLIST ──────────────────────────────"))
+		return lines
+	}
+
+	lines = append(lines, "", styleOK.Render("── Response Headers ──────────────────────────────────"))
+	for _, k := range sortedKeys(e.RespHeaders) {
+		lines = append(lines, fmt.Sprintf("  %s %s", styleDim.Render(fmt.Sprintf("%-25s", k+":")), e.RespHeaders[k]))
+	}
+
+	lines = append(lines, "", styleOK.Render("── Response Body ─────────────────────────────────────"))
+	if e.RespBody == "" {
+		lines = append(lines, styleDim.Render("  (empty)"))
+	} else {
+		for _, l := range strings.Split(prettyJSON(e.RespBody), "\n") {
+			lines = append(lines, "  "+l)
+		}
+	}
+
+	return lines
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m { keys = append(keys, k) }
+	sort.Strings(keys)
+	return keys
+}
+
+func prettyJSON(s string) string {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(s), "", "  "); err != nil {
+		return s
+	}
+	return buf.String()
 }
