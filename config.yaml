@@ -1,0 +1,6 @@
+listenaddr: ":3000"
+maxevents: 1500
+blockeddomains:
+  - doubleclick.net
+  - google-analytics.com
+  - tracking.example.com
