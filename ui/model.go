@@ -106,6 +106,7 @@ type model struct {
 	// intercept state
 	pendingIntercept *proxy.InterceptRequest
 	interceptScroll  int
+	interceptQueue   []proxy.InterceptRequest
 
 	// replay response state
 	replayResult *proxy.Event
@@ -236,8 +237,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editBuf = []rune(ir.Event.ReqBody)
 			m.editCursor = len(m.editBuf)
 		} else {
-			// drop if we are already intercepting something else
-			msg.Decision <- proxy.InterceptDecision{Action: "forward"}
+			m.interceptQueue = append(m.interceptQueue, msg)
 		}
 		return m, checkIntercepts
 
@@ -518,13 +518,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingIntercept.Decision <- proxy.InterceptDecision{Action: "forward", NewBody: string(m.editBuf)}
 					m.pendingIntercept = nil
 				}
-				m.screen = listScreen
+				if len(m.interceptQueue) > 0 {
+					ir := m.interceptQueue[0]
+					m.interceptQueue = m.interceptQueue[1:]
+					m.pendingIntercept = &ir
+					m.editBuf = []rune(ir.Event.ReqBody)
+					m.editCursor = len(m.editBuf)
+				} else {
+					m.screen = listScreen
+				}
 			case "ctrl+d":
 				if m.pendingIntercept != nil {
 					m.pendingIntercept.Decision <- proxy.InterceptDecision{Action: "drop"}
 					m.pendingIntercept = nil
 				}
-				m.screen = listScreen
+				if len(m.interceptQueue) > 0 {
+					ir := m.interceptQueue[0]
+					m.interceptQueue = m.interceptQueue[1:]
+					m.pendingIntercept = &ir
+					m.editBuf = []rune(ir.Event.ReqBody)
+					m.editCursor = len(m.editBuf)
+				} else {
+					m.screen = listScreen
+				}
 			case "backspace":
 				if m.editCursor > 0 {
 					m.editBuf = append(m.editBuf[:m.editCursor-1:m.editCursor-1], m.editBuf[m.editCursor:]...)
@@ -801,7 +817,11 @@ func (m model) interceptView() string {
 	e := m.pendingIntercept.Event
 	var sb strings.Builder
 
-	sb.WriteString(styleIntercept.Render(fmt.Sprintf(" INTERCEPTED: %s %s ", e.Method, e.FullURL)) + "\n")
+	title := fmt.Sprintf(" INTERCEPTED: %s %s ", e.Method, e.FullURL)
+	if len(m.interceptQueue) > 0 {
+		title += fmt.Sprintf(" (+%d in queue) ", len(m.interceptQueue))
+	}
+	sb.WriteString(styleIntercept.Render(title) + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
 	before := string(m.editBuf[:m.editCursor])
