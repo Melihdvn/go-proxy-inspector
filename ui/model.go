@@ -76,6 +76,7 @@ type screen int
 
 const (
 	listScreen screen = iota
+	attackScreen
 	detailScreen
 	editScreen
 	interceptScreen
@@ -108,10 +109,30 @@ type model struct {
 
 	// replay response state
 	replayResult *proxy.Event
+
+	// attack state
+	attackTargetURL string
+	attackUser      string
+	attackWordlist  string
+	attackStatus    string
+	attackActive    bool
+	attackResult    string
+	attackFocus     int
+	attackChan      chan proxy.AttackProgressMsg
 }
 
 func NewModel() model {
-	return model{events: []proxy.Event{}}
+	return model{
+		events:         []proxy.Event{},
+		attackUser:     "admin",
+		attackWordlist: "passwords.txt",
+	}
+}
+
+func waitForAttack(sub chan proxy.AttackProgressMsg) tea.Cmd {
+	return func() tea.Msg {
+		return <-sub
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -188,6 +209,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.events = m.events[:1000]
 		}
 
+	case proxy.AttackProgressMsg:
+		if msg.Status == "Running" {
+			m.attackStatus = fmt.Sprintf("Attempt %d: Trying password '%s'...", msg.AttemptCount, msg.Password)
+			return m, waitForAttack(m.attackChan)
+		} else if msg.Status == "Success" {
+			m.attackActive = false
+			m.attackResult = fmt.Sprintf("[+] SUCCESS! Password found: %s\n[+] Final URL reached: %s", msg.Password, msg.FinalURL)
+			m.attackStatus = ""
+		} else if msg.Status == "Failed" {
+			m.attackActive = false
+			m.attackResult = "[-] Attack finished. Password not found."
+			m.attackStatus = ""
+		} else if msg.Status == "Error" {
+			m.attackActive = false
+			m.attackResult = "[!] Error: " + msg.ErrorMsg
+			m.attackStatus = ""
+		}
+		return m, nil
+
 	case proxy.InterceptRequest:
 		if m.pendingIntercept == nil {
 			ir := msg
@@ -248,6 +288,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+x":
 				m.filterBuf = ""
 				m.cursor = 0
+			case "A":
+				vis := m.filteredEvents()
+				if m.cursor < len(vis) {
+					e := vis[m.cursor]
+					m.attackTargetURL = e.FullURL
+					m.attackStatus = ""
+					m.attackActive = false
+					m.attackResult = ""
+					m.attackFocus = 1 // Username focus
+					m.editBuf = []rune(m.attackUser)
+					m.editCursor = len(m.editBuf)
+					m.attackChan = make(chan proxy.AttackProgressMsg)
+					m.screen = attackScreen
+				}
 			case "x":
 				// JSON Export
 				evs := m.events
@@ -291,6 +345,77 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = statsScreen
 			}
 
+		// ── Attack screen ─────────────────────────────────────────────
+		case attackScreen:
+			if m.attackActive {
+				if msg.String() == "ctrl+c" {
+					return m, tea.Quit
+				}
+				return m, nil
+			}
+
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.screen = listScreen
+			case "up", "k", "shift+tab":
+				// save current
+				if m.attackFocus == 1 {
+					m.attackUser = string(m.editBuf)
+				} else if m.attackFocus == 2 {
+					m.attackWordlist = string(m.editBuf)
+				}
+				m.attackFocus = 1
+				m.editBuf = []rune(m.attackUser)
+				m.editCursor = len(m.editBuf)
+			case "down", "j", "tab":
+				// save current
+				if m.attackFocus == 1 {
+					m.attackUser = string(m.editBuf)
+				} else if m.attackFocus == 2 {
+					m.attackWordlist = string(m.editBuf)
+				}
+				m.attackFocus = 2
+				m.editBuf = []rune(m.attackWordlist)
+				m.editCursor = len(m.editBuf)
+			case "enter":
+				if m.attackFocus == 1 {
+					m.attackUser = string(m.editBuf)
+				} else if m.attackFocus == 2 {
+					m.attackWordlist = string(m.editBuf)
+				}
+				m.attackActive = true
+				m.attackResult = ""
+				m.attackStatus = "Starting attack..."
+				m.attackChan = make(chan proxy.AttackProgressMsg)
+				go proxy.RunBruteForceUI(m.attackTargetURL, m.attackUser, m.attackWordlist, m.attackChan)
+				return m, waitForAttack(m.attackChan)
+			case "backspace":
+				if m.editCursor > 0 {
+					m.editBuf = append(m.editBuf[:m.editCursor-1:m.editCursor-1], m.editBuf[m.editCursor:]...)
+					m.editCursor--
+				}
+			case "delete":
+				if m.editCursor < len(m.editBuf) {
+					m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], m.editBuf[m.editCursor+1:]...)
+				}
+			case "left":
+				if m.editCursor > 0 {
+					m.editCursor--
+				}
+			case "right":
+				if m.editCursor < len(m.editBuf) {
+					m.editCursor++
+				}
+			default:
+				if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+					if len(msg.Runes) > 0 {
+						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append(msg.Runes, m.editBuf[m.editCursor:]...)...)
+						m.editCursor += len(msg.Runes)
+					}
+				}
+			}
 		// ── Detail screen ─────────────────────────────────────────────
 		case detailScreen:
 			switch msg.String() {
@@ -311,6 +436,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editCursor = len(m.editBuf)
 					m.screen = editScreen
 					m.replayMsg = ""
+				}
+			case "A":
+				vis := m.filteredEvents()
+				if m.cursor < len(vis) {
+					e := vis[m.cursor]
+					m.attackTargetURL = e.FullURL
+					m.attackStatus = ""
+					m.attackActive = false
+					m.attackResult = ""
+					m.attackFocus = 1 // Username focus
+					m.editBuf = []rune(m.attackUser)
+					m.editCursor = len(m.editBuf)
+					m.attackChan = make(chan proxy.AttackProgressMsg)
+					m.screen = attackScreen
 				}
 			}
 
@@ -448,6 +587,8 @@ func (m model) View() string {
 	switch m.screen {
 	case detailScreen:
 		return m.detailView()
+	case attackScreen:
+		return m.attackView()
 	case editScreen:
 		return m.editView()
 	case interceptScreen:
@@ -605,6 +746,51 @@ func (m model) editView() string {
 
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 	sb.WriteString(styleDim.Render("ctrl+s:replay  esc:cancel  ←→:cursor") + "\n")
+	return sb.String()
+}
+
+func (m model) attackView() string {
+	var sb strings.Builder
+	sb.WriteString(styleTitle.Render("BRUTE FORCE ATTACK TOOL") + "\n")
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+
+	sb.WriteString("Target URL : " + styleDim.Render(m.attackTargetURL) + "\n")
+
+	userLine := "Username   : "
+	if m.attackFocus == 1 && !m.attackActive {
+		userLine += string(m.editBuf[:m.editCursor]) + "█" + string(m.editBuf[m.editCursor:])
+	} else {
+		userLine += m.attackUser
+	}
+	sb.WriteString(userLine + "\n")
+
+	wordlistLine := "Wordlist   : "
+	if m.attackFocus == 2 && !m.attackActive {
+		wordlistLine += string(m.editBuf[:m.editCursor]) + "█" + string(m.editBuf[m.editCursor:])
+	} else {
+		wordlistLine += m.attackWordlist
+	}
+	sb.WriteString(wordlistLine + "\n")
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+
+	if m.attackActive {
+		sb.WriteString(styleWarn.Render("Status: ") + m.attackStatus + "\n")
+	} else if m.attackResult != "" {
+		if strings.Contains(m.attackResult, "SUCCESS") {
+			sb.WriteString(styleOK.Render(m.attackResult) + "\n")
+		} else {
+			sb.WriteString(styleErr.Render(m.attackResult) + "\n")
+		}
+	} else {
+		sb.WriteString(styleDim.Render("Status: Waiting to start...") + "\n")
+	}
+
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+	if m.attackActive {
+		sb.WriteString(styleDim.Render("ctrl+c:cancel attack") + "\n")
+	} else {
+		sb.WriteString(styleDim.Render("enter:start attack  tab:change field  esc:back  ←→:edit") + "\n")
+	}
 	return sb.String()
 }
 

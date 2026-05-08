@@ -20,7 +20,23 @@ func main() {
 	maxEventsFlag := flag.Int("max-events", 1000, "Maximum number of events to keep in memory")
 	blockFlag := flag.String("block", "", "Comma-separated list of domains to block")
 	configFlag := flag.String("config", "", "Path to YAML config file")
+
+	// Attack mode flags
+	attackFlag := flag.Bool("attack", false, "Run in attack mode instead of proxy mode")
+	targetUrlFlag := flag.String("target-url", "", "Target URL for brute force (e.g., http://localhost:8080/login)")
+	userFlag := flag.String("user", "admin", "Username to use for attack")
+	wordlistFlag := flag.String("wordlist", "passwords.txt", "Path to password wordlist")
+	
 	flag.Parse()
+
+	if *attackFlag {
+		if *targetUrlFlag == "" {
+			fmt.Println("Error: -target-url is required in attack mode")
+			os.Exit(1)
+		}
+		proxy.RunBruteForce(*targetUrlFlag, *userFlag, *wordlistFlag)
+		os.Exit(0)
+	}
 
 	cfg := proxy.DefaultConfig()
 	cfg.ListenAddr = *portFlag

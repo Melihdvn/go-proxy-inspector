@@ -51,6 +51,9 @@ func Start(cfg Config) {
 				req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			}
 
+			// Force server to send uncompressed plain text data
+			req.Header.Del("Accept-Encoding")
+
 			// ── Blocklist check ───────────────────────────────────────
 			if IsBlocked(req.Host) {
 				blocked := Event{
