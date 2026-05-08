@@ -120,6 +120,9 @@ type model struct {
 	attackResult    string
 	attackFocus     int
 	attackChan      chan proxy.AttackProgressMsg
+
+	// selected event for detail/edit screens
+	selectedEvent *proxy.Event
 }
 
 func NewModel() model {
@@ -150,37 +153,39 @@ func checkIntercepts() tea.Msg {
 	}
 }
 
-func (m model) filteredEvents() []proxy.Event {
+func (m model) isEventVisible(e proxy.Event) bool {
 	if m.filterBuf == "" {
-		return m.events
+		return true
 	}
-	out := make([]proxy.Event, 0, len(m.events))
 	
 	// Regex check
 	var re *regexp.Regexp
 	if strings.HasPrefix(m.filterBuf, "regex:") {
 		var err error
 		re, err = regexp.Compile("(?i)" + strings.TrimPrefix(m.filterBuf, "regex:"))
-		if err != nil {
-			re = nil // fallback to no match if invalid
+		if err == nil {
+			return re.MatchString(e.FullURL) || re.MatchString(e.Method)
 		}
 	}
 
 	q := strings.ToLower(m.filterBuf)
+	if strings.HasPrefix(q, "method:") {
+		return strings.ToLower(e.Method) == strings.TrimPrefix(q, "method:")
+	} else if strings.HasPrefix(q, "host:") {
+		return strings.Contains(strings.ToLower(e.Host), strings.TrimPrefix(q, "host:"))
+	} else if strings.HasPrefix(q, "status:") {
+		return fmt.Sprintf("%d", e.Status) == strings.TrimPrefix(q, "status:")
+	}
+	return strings.Contains(strings.ToLower(e.FullURL), q) || strings.Contains(strings.ToLower(e.Method), q)
+}
+
+func (m model) filteredEvents() []proxy.Event {
+	if m.filterBuf == "" {
+		return m.events
+	}
+	out := make([]proxy.Event, 0, len(m.events))
 	for _, e := range m.events {
-		match := false
-		if re != nil {
-			match = re.MatchString(e.FullURL) || re.MatchString(e.Method)
-		} else if strings.HasPrefix(q, "method:") {
-			match = strings.ToLower(e.Method) == strings.TrimPrefix(q, "method:")
-		} else if strings.HasPrefix(q, "host:") {
-			match = strings.Contains(strings.ToLower(e.Host), strings.TrimPrefix(q, "host:"))
-		} else if strings.HasPrefix(q, "status:") {
-			match = fmt.Sprintf("%d", e.Status) == strings.TrimPrefix(q, "status:")
-		} else {
-			match = strings.Contains(strings.ToLower(e.FullURL), q) || strings.Contains(strings.ToLower(e.Method), q)
-		}
-		if match {
+		if m.isEventVisible(e) {
 			out = append(out, e)
 		}
 	}
@@ -195,15 +200,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case proxy.Event:
 		m.events = append([]proxy.Event{msg}, m.events...)
-		if m.screen == listScreen && !m.filterMode {
-			m.cursor++
-			vis := m.filteredEvents()
-			if m.cursor >= len(vis) {
-				m.cursor = len(vis) - 1
-			}
-			if m.cursor < 0 {
+		
+		if m.isEventVisible(msg) {
+			if m.screen == listScreen && m.cursor == 0 && !m.filterMode {
+				// User is at the top of the live feed, stay at 0
 				m.cursor = 0
+			} else {
+				// User is scrolled down or examining details, track the selected item
+				m.cursor++
 			}
+		}
+
+		vis := m.filteredEvents()
+		if m.cursor >= len(vis) {
+			m.cursor = len(vis) - 1
+		}
+		if m.cursor < 0 {
+			m.cursor = 0
 		}
 		// cap events to a hard limit to prevent OOM
 		if len(m.events) > 1000 {
@@ -278,7 +291,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor++
 				}
 			case "enter":
-				if len(m.filteredEvents()) > 0 {
+				vis := m.filteredEvents()
+				if len(vis) > 0 && m.cursor < len(vis) {
+					e := vis[m.cursor]
+					m.selectedEvent = &e
 					m.screen = detailScreen
 					m.detailScroll = 0
 					m.replayMsg = ""
@@ -292,6 +308,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				vis := m.filteredEvents()
 				if m.cursor < len(vis) {
 					e := vis[m.cursor]
+					m.selectedEvent = &e // Track for attack screen too
 					m.attackTargetURL = e.FullURL
 					m.attackStatus = ""
 					m.attackActive = false
@@ -430,17 +447,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "down", "j":
 				m.detailScroll++
 			case "e":
-				vis := m.filteredEvents()
-				if m.cursor < len(vis) {
-					m.editBuf = []rune(vis[m.cursor].ReqBody)
+				if m.selectedEvent != nil {
+					m.editBuf = []rune(m.selectedEvent.ReqBody)
 					m.editCursor = len(m.editBuf)
 					m.screen = editScreen
 					m.replayMsg = ""
 				}
 			case "A":
-				vis := m.filteredEvents()
-				if m.cursor < len(vis) {
-					e := vis[m.cursor]
+				if m.selectedEvent != nil {
+					e := *m.selectedEvent
 					m.attackTargetURL = e.FullURL
 					m.attackStatus = ""
 					m.attackActive = false
@@ -462,19 +477,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = detailScreen
 			case "ctrl+s":
 				body := string(m.editBuf)
-				vis := m.filteredEvents()
-				e := vis[m.cursor]
-				m.exportMsg = "↺ Sending replay..."
-				// Blocking replay so we can show result immediately (in real app, use tea.Cmd)
-				res, err := proxy.ReplayWithResponse(e, body)
-				if err == nil {
-					m.replayResult = &res
-					m.screen = replayResultScreen
-					m.detailScroll = 0
-					proxy.EventChannel <- res // add to list too
-				} else {
-					m.screen = detailScreen
-					m.replayMsg = "⚠ Replay error: " + err.Error()
+				if m.selectedEvent != nil {
+					e := *m.selectedEvent
+					m.exportMsg = "↺ Sending replay..."
+					res, err := proxy.ReplayWithResponse(e, body)
+					if err == nil {
+						m.replayResult = &res
+						m.screen = replayResultScreen
+						m.detailScroll = 0
+						proxy.EventChannel <- res // add to list too
+					} else {
+						m.screen = detailScreen
+						m.replayMsg = "⚠ Replay error: " + err.Error()
+					}
 				}
 			case "backspace":
 				if m.editCursor > 0 {
@@ -705,9 +720,8 @@ func (m model) listView() string {
 }
 
 func (m model) detailView() string {
-	vis := m.filteredEvents()
-	if m.cursor >= len(vis) { return "No event selected.\n" }
-	e := vis[m.cursor]
+	if m.selectedEvent == nil { return "No event selected.\n" }
+	e := *m.selectedEvent
 	
 	var sb strings.Builder
 	header := fmt.Sprintf("[ %s %s — %s — %dms ] %s",
@@ -744,9 +758,8 @@ func (m model) detailView() string {
 }
 
 func (m model) editView() string {
-	vis := m.filteredEvents()
-	if m.cursor >= len(vis) { return "No event selected.\n" }
-	e := vis[m.cursor]
+	if m.selectedEvent == nil { return "No event selected.\n" }
+	e := *m.selectedEvent
 	var sb strings.Builder
 
 	sb.WriteString(stylePUT.Render(fmt.Sprintf("EDIT  [ %s %s ]", e.Method, e.FullURL)) + "\n")
