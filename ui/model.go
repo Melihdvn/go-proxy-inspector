@@ -115,6 +115,8 @@ type model struct {
 	attackTargetURL string
 	attackUser      string
 	attackWordlist  string
+	attackUserField string
+	attackPassField string
 	attackStatus    string
 	attackActive    bool
 	attackResult    string
@@ -127,9 +129,11 @@ type model struct {
 
 func NewModel() model {
 	return model{
-		events:         []proxy.Event{},
-		attackUser:     "admin",
-		attackWordlist: "passwords.txt",
+		events:          []proxy.Event{},
+		attackUser:      "admin",
+		attackWordlist:  "passwords.txt",
+		attackUserField: "username",
+		attackPassField: "password",
 	}
 }
 
@@ -377,36 +381,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.screen = listScreen
 			case "up", "k", "shift+tab":
-				// save current
-				if m.attackFocus == 1 {
-					m.attackUser = string(m.editBuf)
-				} else if m.attackFocus == 2 {
-					m.attackWordlist = string(m.editBuf)
-				}
-				m.attackFocus = 1
-				m.editBuf = []rune(m.attackUser)
-				m.editCursor = len(m.editBuf)
+				m.saveAttackField()
+				m.attackFocus--
+				if m.attackFocus < 1 { m.attackFocus = 4 }
+				m.loadAttackField()
 			case "down", "j", "tab":
-				// save current
-				if m.attackFocus == 1 {
-					m.attackUser = string(m.editBuf)
-				} else if m.attackFocus == 2 {
-					m.attackWordlist = string(m.editBuf)
-				}
-				m.attackFocus = 2
-				m.editBuf = []rune(m.attackWordlist)
-				m.editCursor = len(m.editBuf)
+				m.saveAttackField()
+				m.attackFocus++
+				if m.attackFocus > 4 { m.attackFocus = 1 }
+				m.loadAttackField()
 			case "enter":
-				if m.attackFocus == 1 {
-					m.attackUser = string(m.editBuf)
-				} else if m.attackFocus == 2 {
-					m.attackWordlist = string(m.editBuf)
-				}
+				m.saveAttackField()
 				m.attackActive = true
 				m.attackResult = ""
 				m.attackStatus = "Starting attack..."
 				m.attackChan = make(chan proxy.AttackProgressMsg)
-				go proxy.RunBruteForceUI(m.attackTargetURL, m.attackUser, m.attackWordlist, m.attackChan)
+				config := proxy.AttackConfig{
+					TargetURL: m.attackTargetURL,
+					Username:  m.attackUser,
+					Wordlist:  m.attackWordlist,
+					UserField: m.attackUserField,
+					PassField: m.attackPassField,
+				}
+				go proxy.RunBruteForceUI(config, m.attackChan)
 				return m, waitForAttack(m.attackChan)
 			case "backspace":
 				if m.editCursor > 0 {
@@ -785,21 +782,26 @@ func (m model) attackView() string {
 
 	sb.WriteString("Target URL : " + styleDim.Render(m.attackTargetURL) + "\n")
 
-	userLine := "Username   : "
-	if m.attackFocus == 1 && !m.attackActive {
-		userLine += string(m.editBuf[:m.editCursor]) + "█" + string(m.editBuf[m.editCursor:])
-	} else {
-		userLine += m.attackUser
+	fields := []struct {
+		Label string
+		Value string
+		Focus int
+	}{
+		{"Username   ", m.attackUser, 1},
+		{"Wordlist   ", m.attackWordlist, 2},
+		{"User Field ", m.attackUserField, 3},
+		{"Pass Field ", m.attackPassField, 4},
 	}
-	sb.WriteString(userLine + "\n")
 
-	wordlistLine := "Wordlist   : "
-	if m.attackFocus == 2 && !m.attackActive {
-		wordlistLine += string(m.editBuf[:m.editCursor]) + "█" + string(m.editBuf[m.editCursor:])
-	} else {
-		wordlistLine += m.attackWordlist
+	for _, f := range fields {
+		line := f.Label + ": "
+		if m.attackFocus == f.Focus && !m.attackActive {
+			line += string(m.editBuf[:m.editCursor]) + "█" + string(m.editBuf[m.editCursor:])
+		} else {
+			line += f.Value
+		}
+		sb.WriteString(line + "\n")
 	}
-	sb.WriteString(wordlistLine + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
 	if m.attackActive {
@@ -989,3 +991,24 @@ func prettyJSON(s string) string {
 	}
 	return buf.String()
 }
+
+func (m *model) saveAttackField() {
+	switch m.attackFocus {
+	case 1: m.attackUser = string(m.editBuf)
+	case 2: m.attackWordlist = string(m.editBuf)
+	case 3: m.attackUserField = string(m.editBuf)
+	case 4: m.attackPassField = string(m.editBuf)
+	}
+}
+
+func (m *model) loadAttackField() {
+	var s string
+	switch m.attackFocus {
+	case 1: s = m.attackUser
+	case 2: s = m.attackWordlist
+	case 3: s = m.attackUserField
+	case 4: s = m.attackPassField
+	}
+	m.editBuf = []rune(s)
+	m.editCursor = len(m.editBuf)
+}
