@@ -112,16 +112,19 @@ type model struct {
 	replayResult *proxy.Event
 
 	// attack state
-	attackTargetURL string
-	attackUser      string
-	attackWordlist  string
-	attackUserField string
-	attackPassField string
-	attackStatus    string
-	attackActive    bool
-	attackResult    string
-	attackFocus     int
-	attackChan      chan proxy.AttackProgressMsg
+	attackTargetURL    string
+	attackUser         string
+	attackWordlist     string
+	attackUserField    string
+	attackPassField    string
+	attackSuccessRegex string
+	attackConcurrency  int
+	attackIsJSON       bool
+	attackStatus       string
+	attackActive       bool
+	attackResult       string
+	attackFocus        int
+	attackChan         chan proxy.AttackProgressMsg
 
 	// selected event for detail/edit screens
 	selectedEvent *proxy.Event
@@ -129,11 +132,12 @@ type model struct {
 
 func NewModel() model {
 	return model{
-		events:          []proxy.Event{},
-		attackUser:      "admin",
-		attackWordlist:  "passwords.txt",
-		attackUserField: "username",
-		attackPassField: "password",
+		events:            []proxy.Event{},
+		attackUser:        "admin",
+		attackWordlist:    "passwords.txt",
+		attackUserField:   "username",
+		attackPassField:   "password",
+		attackConcurrency: 5,
 	}
 }
 
@@ -383,13 +387,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "up", "k", "shift+tab":
 				m.saveAttackField()
 				m.attackFocus--
-				if m.attackFocus < 1 { m.attackFocus = 4 }
+				if m.attackFocus < 1 { m.attackFocus = 7 }
 				m.loadAttackField()
 			case "down", "j", "tab":
 				m.saveAttackField()
 				m.attackFocus++
-				if m.attackFocus > 4 { m.attackFocus = 1 }
+				if m.attackFocus > 7 { m.attackFocus = 1 }
 				m.loadAttackField()
+			case " ":
+				if m.attackFocus == 7 {
+					m.attackIsJSON = !m.attackIsJSON
+				} else {
+					if m.editCursor <= len(m.editBuf) {
+						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append([]rune{' '}, m.editBuf[m.editCursor:]...)...)
+						m.editCursor++
+					}
+				}
 			case "enter":
 				m.saveAttackField()
 				m.attackActive = true
@@ -397,11 +410,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.attackStatus = "Starting attack..."
 				m.attackChan = make(chan proxy.AttackProgressMsg)
 				config := proxy.AttackConfig{
-					TargetURL: m.attackTargetURL,
-					Username:  m.attackUser,
-					Wordlist:  m.attackWordlist,
-					UserField: m.attackUserField,
-					PassField: m.attackPassField,
+					TargetURL:    m.attackTargetURL,
+					Username:     m.attackUser,
+					Wordlist:     m.attackWordlist,
+					UserField:    m.attackUserField,
+					PassField:    m.attackPassField,
+					SuccessRegex: m.attackSuccessRegex,
+					Concurrency:  m.attackConcurrency,
+					IsJSON:       m.attackIsJSON,
 				}
 				go proxy.RunBruteForceUI(config, m.attackChan)
 				return m, waitForAttack(m.attackChan)
@@ -791,6 +807,8 @@ func (m model) attackView() string {
 		{"Wordlist   ", m.attackWordlist, 2},
 		{"User Field ", m.attackUserField, 3},
 		{"Pass Field ", m.attackPassField, 4},
+		{"Success RE ", m.attackSuccessRegex, 5},
+		{"Concurrent ", fmt.Sprintf("%d", m.attackConcurrency), 6},
 	}
 
 	for _, f := range fields {
@@ -920,6 +938,7 @@ List Screen:
   h           Export all events to HAR (DevTools compatible)
   r           Quick replay selected request
   b           Block selected request's host
+  A           Open Brute Force Attack Tool for request
   B           View Blocklist
   S           View Statistics (Latency histogram, etc)
 
@@ -927,6 +946,7 @@ Detail Screen:
   ↑/k, ↓/j    Scroll headers and body
   e           Edit request body
   r           Quick replay
+  A           Open Brute Force Attack Tool
 
 Intercept Screen:
   ctrl+f      Forward request (with modified body)
@@ -998,6 +1018,11 @@ func (m *model) saveAttackField() {
 	case 2: m.attackWordlist = string(m.editBuf)
 	case 3: m.attackUserField = string(m.editBuf)
 	case 4: m.attackPassField = string(m.editBuf)
+	case 5: m.attackSuccessRegex = string(m.editBuf)
+	case 6:
+		var c int
+		fmt.Sscanf(string(m.editBuf), "%d", &c)
+		if c > 0 { m.attackConcurrency = c }
 	}
 }
 
@@ -1008,7 +1033,11 @@ func (m *model) loadAttackField() {
 	case 2: s = m.attackWordlist
 	case 3: s = m.attackUserField
 	case 4: s = m.attackPassField
+	case 5: s = m.attackSuccessRegex
+	case 6: s = fmt.Sprintf("%d", m.attackConcurrency)
+	case 7: s = "" // JSON toggle
 	}
 	m.editBuf = []rune(s)
 	m.editCursor = len(m.editBuf)
-}
+}
+
