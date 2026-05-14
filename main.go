@@ -26,6 +26,18 @@ func main() {
 	targetUrlFlag := flag.String("target-url", "", "Target URL for brute force (e.g., http://localhost:8080/login)")
 	userFlag := flag.String("user", "admin", "Username to use for attack")
 	wordlistFlag := flag.String("wordlist", "passwords.txt", "Path to password wordlist")
+	userFieldFlag := flag.String("user-field", "username", "Form field name for username")
+	passFieldFlag := flag.String("pass-field", "password", "Form field name for password")
+	regexFlag := flag.String("success-regex", "", "Regex to detect success in response")
+	concurrencyFlag := flag.Int("concurrency", 5, "Number of concurrent workers")
+	jsonFlag := flag.Bool("json", false, "Send payload as JSON instead of form-urlencoded")
+	delayFlag := flag.Int("delay", 0, "Delay in ms between each request")
+	batchSizeFlag := flag.Int("batch-size", 0, "Number of requests before a longer batch delay")
+	batchDelayFlag := flag.Int("batch-delay", 0, "Longer delay in ms after batch-size requests")
+	expStatusFlag := flag.Int("expected-status", 0, "Status code to check (0 to disable)")
+	statusSuccessFlag := flag.Bool("status-success", true, "If true, expected-status means success; else failure")
+	genCharsetFlag := flag.String("gen-charset", "abcdefghijklmnopqrstuvwxyz0123456789", "Characters for auto-generation")
+	genMaxLenFlag := flag.Int("gen-maxlen", 4, "Max length for auto-generation")
 	
 	flag.Parse()
 
@@ -34,7 +46,23 @@ func main() {
 			fmt.Println("Error: -target-url is required in attack mode")
 			os.Exit(1)
 		}
-		proxy.RunBruteForce(*targetUrlFlag, *userFlag, *wordlistFlag)
+		proxy.RunBruteForce(proxy.AttackConfig{
+			TargetURL:    *targetUrlFlag,
+			Username:     *userFlag,
+			Wordlist:     *wordlistFlag,
+			UserField:    *userFieldFlag,
+			PassField:    *passFieldFlag,
+			SuccessRegex: *regexFlag,
+			Concurrency:  *concurrencyFlag,
+			IsJSON:       *jsonFlag,
+			DelayMs:      *delayFlag,
+			BatchSize:    *batchSizeFlag,
+			BatchDelayMs: *batchDelayFlag,
+			ExpectedStatus: *expStatusFlag,
+			StatusIsSuccess: *statusSuccessFlag,
+			GenCharset:     *genCharsetFlag,
+			GenMaxLen:      *genMaxLenFlag,
+		})
 		os.Exit(0)
 	}
 

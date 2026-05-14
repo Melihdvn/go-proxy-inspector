@@ -120,11 +120,19 @@ type model struct {
 	attackSuccessRegex string
 	attackConcurrency  int
 	attackIsJSON       bool
+	attackDelayMs      int
+	attackBatchSize    int
+	attackBatchDelayMs int
+	attackExpectedStatus int
+	attackStatusIsSuccess bool
+	attackGenCharset     string
+	attackGenMaxLen      int
 	attackStatus       string
 	attackActive       bool
 	attackResult       string
 	attackFocus        int
 	attackChan         chan proxy.AttackProgressMsg
+	attackFocusMax     int // dynamic max focus based on fields
 
 	// selected event for detail/edit screens
 	selectedEvent *proxy.Event
@@ -138,6 +146,9 @@ func NewModel() model {
 		attackUserField:   "username",
 		attackPassField:   "password",
 		attackConcurrency: 5,
+		attackGenCharset: "abcdefghijklmnopqrstuvwxyz0123456789",
+		attackGenMaxLen:  4,
+		attackFocusMax:   15, // URL, User, Wordlist, UserField, PassField, Regex, Concurrency, JSON, Delay, BatchSize, BatchDelay, ExpStatus, StatusIsSuccess, GenCharset, GenMaxLen
 	}
 }
 
@@ -368,6 +379,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = blocklistScreen
 			case "S":
 				m.screen = statsScreen
+			case "T":
+				// General Brute Force Tool
+				m.attackTargetURL = "http://"
+				m.attackStatus = ""
+				m.attackActive = false
+				m.attackResult = ""
+				m.attackFocus = 0 // Target URL focus
+				m.editBuf = []rune(m.attackTargetURL)
+				m.editCursor = len(m.editBuf)
+				m.attackChan = make(chan proxy.AttackProgressMsg)
+				m.screen = attackScreen
 			}
 
 		// ── Attack screen ─────────────────────────────────────────────
@@ -387,16 +409,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "up", "k", "shift+tab":
 				m.saveAttackField()
 				m.attackFocus--
-				if m.attackFocus < 1 { m.attackFocus = 7 }
+				if m.attackFocus < 0 { m.attackFocus = m.attackFocusMax - 1 }
 				m.loadAttackField()
 			case "down", "j", "tab":
 				m.saveAttackField()
 				m.attackFocus++
-				if m.attackFocus > 7 { m.attackFocus = 1 }
+				if m.attackFocus >= m.attackFocusMax { m.attackFocus = 0 }
 				m.loadAttackField()
 			case " ":
-				if m.attackFocus == 7 {
+				if m.attackFocus == 7 { // JSON toggle
 					m.attackIsJSON = !m.attackIsJSON
+				} else if m.attackFocus == 12 { // StatusIsSuccess toggle
+					m.attackStatusIsSuccess = !m.attackStatusIsSuccess
 				} else {
 					if m.editCursor <= len(m.editBuf) {
 						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append([]rune{' '}, m.editBuf[m.editCursor:]...)...)
@@ -418,6 +442,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					SuccessRegex: m.attackSuccessRegex,
 					Concurrency:  m.attackConcurrency,
 					IsJSON:       m.attackIsJSON,
+					DelayMs:      m.attackDelayMs,
+					BatchSize:    m.attackBatchSize,
+					BatchDelayMs: m.attackBatchDelayMs,
+					ExpectedStatus: m.attackExpectedStatus,
+					StatusIsSuccess: m.attackStatusIsSuccess,
+					GenCharset:     m.attackGenCharset,
+					GenMaxLen:      m.attackGenMaxLen,
 				}
 				go proxy.RunBruteForceUI(config, m.attackChan)
 				return m, waitForAttack(m.attackChan)
@@ -479,6 +510,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.attackChan = make(chan proxy.AttackProgressMsg)
 					m.screen = attackScreen
 				}
+			case "T":
+				m.attackTargetURL = "http://"
+				m.attackStatus = ""
+				m.attackActive = false
+				m.attackResult = ""
+				m.attackFocus = 0
+				m.editBuf = []rune(m.attackTargetURL)
+				m.editCursor = len(m.editBuf)
+				m.attackChan = make(chan proxy.AttackProgressMsg)
+				m.screen = attackScreen
 			}
 
 		// ── Edit screen ───────────────────────────────────────────────
@@ -728,7 +769,7 @@ func (m model) listView() string {
 	}
 
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
-	sb.WriteString(styleDim.Render("?:help  q:quit  ↑/↓:nav  enter:detail  /:filter  i:intercept") + "\n")
+	sb.WriteString(styleDim.Render("?:help  q:quit  ↑/↓:nav  enter:detail  /:filter  i:intercept  T:attack tool") + "\n")
 	return sb.String()
 }
 
@@ -766,7 +807,7 @@ func (m model) detailView() string {
 	}
 
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
-	sb.WriteString(styleDim.Render("esc:back  e:edit  r:replay  b:block host  ↑/↓:scroll") + "\n")
+	sb.WriteString(styleDim.Render("esc:back  e:edit  r:replay  b:block host  A:attack  T:tool  ↑/↓:scroll") + "\n")
 	return sb.String()
 }
 
@@ -796,19 +837,26 @@ func (m model) attackView() string {
 	sb.WriteString(styleTitle.Render("BRUTE FORCE ATTACK TOOL") + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
-	sb.WriteString("Target URL : " + styleDim.Render(m.attackTargetURL) + "\n")
-
 	fields := []struct {
 		Label string
 		Value string
 		Focus int
 	}{
+		{"Target URL ", m.attackTargetURL, 0},
 		{"Username   ", m.attackUser, 1},
 		{"Wordlist   ", m.attackWordlist, 2},
 		{"User Field ", m.attackUserField, 3},
 		{"Pass Field ", m.attackPassField, 4},
 		{"Success RE ", m.attackSuccessRegex, 5},
 		{"Concurrent ", fmt.Sprintf("%d", m.attackConcurrency), 6},
+		{"JSON Mode  ", fmt.Sprintf("%v", m.attackIsJSON), 7},
+		{"Delay (ms) ", fmt.Sprintf("%d", m.attackDelayMs), 8},
+		{"Batch Size ", fmt.Sprintf("%d", m.attackBatchSize), 9},
+		{"Batch Delay", fmt.Sprintf("%d", m.attackBatchDelayMs), 10},
+		{"Exp Status  ", fmt.Sprintf("%d", m.attackExpectedStatus), 11},
+		{"Success ifSt", fmt.Sprintf("%v", m.attackStatusIsSuccess), 12},
+		{"Gen Charset ", m.attackGenCharset, 13},
+		{"Gen Max Len ", fmt.Sprintf("%d", m.attackGenMaxLen), 14},
 	}
 
 	for _, f := range fields {
@@ -939,6 +987,7 @@ List Screen:
   r           Quick replay selected request
   b           Block selected request's host
   A           Open Brute Force Attack Tool for request
+  T           Open General Brute Force Tool
   B           View Blocklist
   S           View Statistics (Latency histogram, etc)
 
@@ -1014,6 +1063,7 @@ func prettyJSON(s string) string {
 
 func (m *model) saveAttackField() {
 	switch m.attackFocus {
+	case 0: m.attackTargetURL = string(m.editBuf)
 	case 1: m.attackUser = string(m.editBuf)
 	case 2: m.attackWordlist = string(m.editBuf)
 	case 3: m.attackUserField = string(m.editBuf)
@@ -1023,19 +1073,49 @@ func (m *model) saveAttackField() {
 		var c int
 		fmt.Sscanf(string(m.editBuf), "%d", &c)
 		if c > 0 { m.attackConcurrency = c }
+	case 8:
+		var d int
+		fmt.Sscanf(string(m.editBuf), "%d", &d)
+		m.attackDelayMs = d
+	case 9:
+		var b int
+		fmt.Sscanf(string(m.editBuf), "%d", &b)
+		m.attackBatchSize = b
+	case 10:
+		var bd int
+		fmt.Sscanf(string(m.editBuf), "%d", &bd)
+		m.attackBatchDelayMs = bd
+	case 11:
+		var es int
+		fmt.Sscanf(string(m.editBuf), "%d", &es)
+		m.attackExpectedStatus = es
+	case 13:
+		m.attackGenCharset = string(m.editBuf)
+	case 14:
+		var ml int
+		fmt.Sscanf(string(m.editBuf), "%d", &ml)
+		if ml > 0 { m.attackGenMaxLen = ml }
 	}
 }
 
 func (m *model) loadAttackField() {
 	var s string
 	switch m.attackFocus {
+	case 0: s = m.attackTargetURL
 	case 1: s = m.attackUser
 	case 2: s = m.attackWordlist
 	case 3: s = m.attackUserField
 	case 4: s = m.attackPassField
 	case 5: s = m.attackSuccessRegex
 	case 6: s = fmt.Sprintf("%d", m.attackConcurrency)
-	case 7: s = "" // JSON toggle
+	case 7: s = fmt.Sprintf("%v", m.attackIsJSON)
+	case 8: s = fmt.Sprintf("%d", m.attackDelayMs)
+	case 9: s = fmt.Sprintf("%d", m.attackBatchSize)
+	case 10: s = fmt.Sprintf("%d", m.attackBatchDelayMs)
+	case 11: s = fmt.Sprintf("%d", m.attackExpectedStatus)
+	case 12: s = fmt.Sprintf("%v", m.attackStatusIsSuccess)
+	case 13: s = m.attackGenCharset
+	case 14: s = fmt.Sprintf("%d", m.attackGenMaxLen)
 	}
 	m.editBuf = []rune(s)
 	m.editCursor = len(m.editBuf)

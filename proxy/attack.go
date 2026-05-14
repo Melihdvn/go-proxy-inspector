@@ -24,6 +24,13 @@ type AttackConfig struct {
 	SuccessRegex string // optional regex to check in response body
 	Concurrency  int    // number of workers
 	IsJSON       bool   // if true, send as JSON instead of form-urlencoded
+	DelayMs      int    // Delay between each request
+	BatchSize    int    // Number of requests before a longer batch delay
+	BatchDelayMs int    // Longer delay after BatchSize requests
+	ExpectedStatus int  // Status code to check
+	StatusIsSuccess bool // True: ExpectedStatus means success; False: ExpectedStatus means failure
+	GenCharset     string // Characters to use if wordlist is empty
+	GenMaxLen      int    // Max length for generated passwords
 }
 
 type AttackProgressMsg struct {
@@ -57,13 +64,25 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg) {
 	if config.Concurrency <= 0 {
 		config.Concurrency = 1
 	}
-
-	file, err := os.Open(config.Wordlist)
-	if err != nil {
-		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error opening wordlist: %v", err)}
-		return
+	if config.GenCharset == "" {
+		config.GenCharset = "abcdefghijklmnopqrstuvwxyz0123456789"
 	}
-	defer file.Close()
+	if config.GenMaxLen <= 0 {
+		config.GenMaxLen = 4 // Default safety limit
+	}
+
+	var scanner *bufio.Scanner
+	var file *os.File
+	var err error
+	if config.Wordlist != "" {
+		file, err = os.Open(config.Wordlist)
+		if err != nil {
+			updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error opening wordlist: %v", err)}
+			return
+		}
+		defer file.Close()
+		scanner = bufio.NewScanner(file)
+	}
 
 	var successRegex *regexp.Regexp
 	if config.SuccessRegex != "" {
@@ -134,7 +153,14 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg) {
 				res.finalURL = resp.Request.URL.String()
 				
 				// Success detection logic
-				if resp.StatusCode == 302 || resp.StatusCode == 301 {
+				if config.ExpectedStatus > 0 {
+					match := resp.StatusCode == config.ExpectedStatus
+					if config.StatusIsSuccess {
+						res.success = match
+					} else {
+						res.success = !match
+					}
+				} else if resp.StatusCode == 302 || resp.StatusCode == 301 {
 					// Redirect is usually a sign of success in login forms
 					res.success = true
 					res.finalURL = resp.Header.Get("Location")
@@ -157,6 +183,16 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg) {
 				}
 
 				results <- res
+
+				// Delay logic
+				if config.DelayMs > 0 {
+					time.Sleep(time.Duration(config.DelayMs) * time.Millisecond)
+				}
+				if config.BatchSize > 0 && job.attempt % config.BatchSize == 0 {
+					if config.BatchDelayMs > 0 {
+						time.Sleep(time.Duration(config.BatchDelayMs) * time.Millisecond)
+					}
+				}
 			}
 		}()
 	}
@@ -180,15 +216,36 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg) {
 		done <- true
 	}()
 
-	// Scanner
-	scanner := bufio.NewScanner(file)
+	// Scanner or Generator
 	attemptCount := 0
-	for scanner.Scan() {
-		if finalResult != nil { break }
-		password := strings.TrimSpace(scanner.Text())
-		if password == "" { continue }
-		attemptCount++
-		jobs <- attackJob{password: password, attempt: attemptCount}
+	if scanner != nil {
+		for scanner.Scan() {
+			if finalResult != nil { break }
+			password := strings.TrimSpace(scanner.Text())
+			if password == "" { continue }
+			attemptCount++
+			jobs <- attackJob{password: password, attempt: attemptCount}
+		}
+	} else {
+		// Generate combinations
+		chars := []rune(config.GenCharset)
+		var generate func(prefix string, length int) bool
+		generate = func(prefix string, length int) bool {
+			if length == 0 {
+				if finalResult != nil { return true }
+				attemptCount++
+				jobs <- attackJob{password: prefix, attempt: attemptCount}
+				return false
+			}
+			for _, c := range chars {
+				if generate(prefix+string(c), length-1) { return true }
+			}
+			return false
+		}
+
+		for l := 1; l <= config.GenMaxLen; l++ {
+			if generate("", l) { break }
+		}
 	}
 	close(jobs)
 	wg.Wait()
@@ -205,9 +262,11 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg) {
 		return
 	}
 
-	if err := scanner.Err(); err != nil {
-		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error reading wordlist: %v", err)}
-		return
+	if scanner != nil {
+		if err := scanner.Err(); err != nil {
+			updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error reading wordlist: %v", err)}
+			return
+		}
 	}
 
 	updateChan <- AttackProgressMsg{Status: "Failed"}
