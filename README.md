@@ -18,6 +18,8 @@ Sit between your OS/Browser and the internet, inspect every HTTP/HTTPS request a
 - **Traffic Statistics** — View a latency histogram, status code breakdown, and top hosts.
 - **HAR Export** — Export traffic to HTTP Archive format (HAR) compatible with Chrome DevTools.
 - **YAML Config** — Supports saving settings to `config.yaml`.
+- **Brute Force Tool** — Built-in attack module with rate limiting (delays/batching), status code success criteria, and automated password generation.
+- **Auto-Generation Mode** — Automatically generates password combinations if no wordlist is provided.
 
 ---
 
@@ -70,6 +72,8 @@ Sit between your OS/Browser and the internet, inspect every HTTP/HTTPS request a
 | `h` | Export events to HAR (Browser DevTools compatible) |
 | `r` | Quick replay selected request |
 | `b` | Block selected request's host |
+| `A` | Open Brute Force Tool for selected request |
+| `T` | Open General Brute Force Tool (empty URL) |
 | `B` | View Blocklist |
 | `S` | View Statistics |
 
@@ -78,6 +82,7 @@ Sit between your OS/Browser and the internet, inspect every HTTP/HTTPS request a
 |-----|--------|
 | `e` | Open edit mode |
 | `ctrl+s`| Replay with edited body |
+| `A` | Open Brute Force Tool for this request |
 | `↑` / `↓` | Scroll up/down |
 
 ### Intercept Screen
@@ -85,6 +90,23 @@ Sit between your OS/Browser and the internet, inspect every HTTP/HTTPS request a
 |-----|--------|
 | `ctrl+f`| Forward request (with modified body) |
 | `ctrl+d`| Drop request |
+
+---
+
+## Brute Force Tool
+
+The built-in brute force module allows you to test login endpoints for credential vulnerabilities.
+
+### Accessing
+- **Shift+A**: Open the tool prepopulated with the selected request's URL and field names.
+- **Shift+T**: Open a fresh Brute Force Tool with an empty target URL.
+
+### Advanced Features
+- **Auto-Generation**: Leave the `Wordlist` field empty to trigger automated password generation. You can configure the character set and maximum length.
+- **Success Criteria**: Define success based on a specific HTTP Status Code (e.g., "Success if status is 200" or "Success if status is NOT 403").
+- **Rate Limit Bypass**: 
+    - `Delay`: Milliseconds to wait between every individual request.
+    - `Batch`: Pause for a longer duration after every `N` requests to avoid triggering security blocks.
 
 ---
 
