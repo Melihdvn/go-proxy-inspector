@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"net/url"
 
 	"proxy-inspector/proxy"
 
@@ -137,6 +138,13 @@ type model struct {
 	attackChan         chan proxy.AttackProgressMsg
 	attackCancel       chan bool
 	attackFocusMax     int // dynamic max focus based on fields
+
+	// Interactive field selection
+	attackAvailableFields []string
+	attackUserFieldIndex  int
+	attackPassFieldIndex  int
+	attackOriginalBody    string
+	attackHeaders         map[string]string
 
 	// selected event for detail/edit screens
 	selectedEvent *proxy.Event
@@ -347,6 +355,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.attackActive = false
 					m.attackResult = ""
 					m.attackFocus = 1 // Username focus
+					
+					// --- Auto-Discovery (Alanları Bulma) ---
+					m.attackOriginalBody = e.ReqBody
+					m.attackHeaders = e.ReqHeaders
+					m.attackAvailableFields = []string{"[MANUEL]"}
+					
+					// Form parser
+					if strings.Contains(e.ReqHeaders["Content-Type"], "application/x-www-form-urlencoded") {
+						parsed, _ := url.ParseQuery(e.ReqBody)
+						for k := range parsed {
+							m.attackAvailableFields = append(m.attackAvailableFields, k)
+						}
+					} else { // JSON parser dener
+						var jsonData map[string]interface{}
+						if err := json.Unmarshal([]byte(e.ReqBody), &jsonData); err == nil {
+							for k := range jsonData {
+								m.attackAvailableFields = append(m.attackAvailableFields, k)
+							}
+						}
+					}
+					
+					// Default indexler
+					m.attackUserFieldIndex = 0
+					m.attackPassFieldIndex = 0
+					if len(m.attackAvailableFields) > 1 {
+						for i, f := range m.attackAvailableFields {
+							lf := strings.ToLower(f)
+							if strings.Contains(lf, "user") || strings.Contains(lf, "email") || lf == "u" {
+								m.attackUserFieldIndex = i
+							}
+							if strings.Contains(lf, "pass") || strings.Contains(lf, "pwd") || lf == "p" {
+								m.attackPassFieldIndex = i
+							}
+						}
+					}
+					m.attackUserField = m.attackAvailableFields[m.attackUserFieldIndex]
+					m.attackPassField = m.attackAvailableFields[m.attackPassFieldIndex]
+					// ---------------------------------------
+
 					m.editBuf = []rune(m.attackUser)
 					m.editCursor = len(m.editBuf)
 					m.attackChan = make(chan proxy.AttackProgressMsg)
@@ -491,15 +538,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], m.editBuf[m.editCursor+1:]...)
 				}
 			case "left":
-				if m.editCursor > 0 {
+				if m.attackFocus == 3 && len(m.attackAvailableFields) > 1 {
+					m.attackUserFieldIndex--
+					if m.attackUserFieldIndex < 0 { m.attackUserFieldIndex = len(m.attackAvailableFields) - 1 }
+					m.attackUserField = m.attackAvailableFields[m.attackUserFieldIndex]
+					m.editBuf = []rune(m.attackUserField)
+					m.editCursor = len(m.editBuf)
+				} else if m.attackFocus == 4 && len(m.attackAvailableFields) > 1 {
+					m.attackPassFieldIndex--
+					if m.attackPassFieldIndex < 0 { m.attackPassFieldIndex = len(m.attackAvailableFields) - 1 }
+					m.attackPassField = m.attackAvailableFields[m.attackPassFieldIndex]
+					m.editBuf = []rune(m.attackPassField)
+					m.editCursor = len(m.editBuf)
+				} else if m.editCursor > 0 {
 					m.editCursor--
 				}
 			case "right":
-				if m.editCursor < len(m.editBuf) {
+				if m.attackFocus == 3 && len(m.attackAvailableFields) > 1 {
+					m.attackUserFieldIndex++
+					if m.attackUserFieldIndex >= len(m.attackAvailableFields) { m.attackUserFieldIndex = 0 }
+					m.attackUserField = m.attackAvailableFields[m.attackUserFieldIndex]
+					m.editBuf = []rune(m.attackUserField)
+					m.editCursor = len(m.editBuf)
+				} else if m.attackFocus == 4 && len(m.attackAvailableFields) > 1 {
+					m.attackPassFieldIndex++
+					if m.attackPassFieldIndex >= len(m.attackAvailableFields) { m.attackPassFieldIndex = 0 }
+					m.attackPassField = m.attackAvailableFields[m.attackPassFieldIndex]
+					m.editBuf = []rune(m.attackPassField)
+					m.editCursor = len(m.editBuf)
+				} else if m.editCursor < len(m.editBuf) {
 					m.editCursor++
 				}
 			default:
 				if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+					// Eğer "[MANUEL]" seçili değilse klavyeden yazı yazılmasını engelle
+					if m.attackFocus == 3 && m.attackUserField != "[MANUEL]" { return m, nil }
+					if m.attackFocus == 4 && m.attackPassField != "[MANUEL]" { return m, nil }
+
 					if len(msg.Runes) > 0 {
 						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append(msg.Runes, m.editBuf[m.editCursor:]...)...)
 						m.editCursor += len(msg.Runes)
@@ -534,6 +609,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.attackActive = false
 					m.attackResult = ""
 					m.attackFocus = 1 // Username focus
+					
+					// --- Auto-Discovery (Alanları Bulma) ---
+					m.attackOriginalBody = e.ReqBody
+					m.attackHeaders = e.ReqHeaders
+					m.attackAvailableFields = []string{"[MANUEL]"}
+					
+					if strings.Contains(e.ReqHeaders["Content-Type"], "application/x-www-form-urlencoded") {
+						parsed, _ := url.ParseQuery(e.ReqBody)
+						for k := range parsed {
+							m.attackAvailableFields = append(m.attackAvailableFields, k)
+						}
+					} else {
+						var jsonData map[string]interface{}
+						if err := json.Unmarshal([]byte(e.ReqBody), &jsonData); err == nil {
+							for k := range jsonData {
+								m.attackAvailableFields = append(m.attackAvailableFields, k)
+							}
+						}
+					}
+					
+					m.attackUserFieldIndex = 0
+					m.attackPassFieldIndex = 0
+					if len(m.attackAvailableFields) > 1 {
+						for i, f := range m.attackAvailableFields {
+							lf := strings.ToLower(f)
+							if strings.Contains(lf, "user") || strings.Contains(lf, "email") || lf == "u" {
+								m.attackUserFieldIndex = i
+							}
+							if strings.Contains(lf, "pass") || strings.Contains(lf, "pwd") || lf == "p" {
+								m.attackPassFieldIndex = i
+							}
+						}
+					}
+					m.attackUserField = m.attackAvailableFields[m.attackUserFieldIndex]
+					m.attackPassField = m.attackAvailableFields[m.attackPassFieldIndex]
+					// ---------------------------------------
+
 					m.editBuf = []rune(m.attackUser)
 					m.editCursor = len(m.editBuf)
 					m.attackChan = make(chan proxy.AttackProgressMsg)
@@ -866,6 +978,28 @@ func (m model) attackView() string {
 	sb.WriteString(styleTitle.Render("BRUTE FORCE ATTACK TOOL") + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
+	userFieldDisplay := m.attackUserField
+	if m.attackFocus == 3 && len(m.attackAvailableFields) > 1 {
+		if m.attackUserField == "[MANUEL]" {
+			userFieldDisplay = "< [MANUEL] > (Type below)"
+		} else {
+			userFieldDisplay = fmt.Sprintf("< %s >", m.attackUserField)
+		}
+	} else if m.attackUserField == "[MANUEL]" {
+		userFieldDisplay = "[MANUEL]"
+	}
+
+	passFieldDisplay := m.attackPassField
+	if m.attackFocus == 4 && len(m.attackAvailableFields) > 1 {
+		if m.attackPassField == "[MANUEL]" {
+			passFieldDisplay = "< [MANUEL] > (Type below)"
+		} else {
+			passFieldDisplay = fmt.Sprintf("< %s >", m.attackPassField)
+		}
+	} else if m.attackPassField == "[MANUEL]" {
+		passFieldDisplay = "[MANUEL]"
+	}
+
 	fields := []struct {
 		Label string
 		Value string
@@ -874,8 +1008,8 @@ func (m model) attackView() string {
 		{"Target URL ", m.attackTargetURL, 0},
 		{"Username   ", m.attackUser, 1},
 		{"Wordlist   ", m.attackWordlist, 2},
-		{"User Field ", m.attackUserField, 3},
-		{"Pass Field ", m.attackPassField, 4},
+		{"User Field ", userFieldDisplay, 3},
+		{"Pass Field ", passFieldDisplay, 4},
 		{"Success RE ", m.attackSuccessRegex, 5},
 		{"Concurrent ", fmt.Sprintf("%d", m.attackConcurrency), 6},
 		{"JSON Mode  ", fmt.Sprintf("%v", m.attackIsJSON), 7},
@@ -900,6 +1034,17 @@ func (m model) attackView() string {
 		}
 		sb.WriteString(line + "\n")
 	}
+	sb.WriteString(strings.Repeat("─", 62) + "\n")
+	
+	// Payload Preview
+	sb.WriteString(styleDim.Render("Payload Preview:") + "\n")
+	preview := m.attackOriginalBody
+	if preview == "" {
+		preview = "(Auto-generated based on fields)"
+	} else if len(preview) > 150 {
+		preview = preview[:147] + "..."
+	}
+	sb.WriteString("  " + preview + "\n")
 	sb.WriteString(strings.Repeat("─", 62) + "\n")
 
 	if m.attackActive {
