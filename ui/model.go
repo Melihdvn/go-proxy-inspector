@@ -127,11 +127,15 @@ type model struct {
 	attackStatusIsSuccess bool
 	attackGenCharset     string
 	attackGenMaxLen      int
+	attackProxyList      string
+	attackRandomUA       bool
+	attackRandomIP       bool
 	attackStatus       string
 	attackActive       bool
 	attackResult       string
 	attackFocus        int
 	attackChan         chan proxy.AttackProgressMsg
+	attackCancel       chan bool
 	attackFocusMax     int // dynamic max focus based on fields
 
 	// selected event for detail/edit screens
@@ -148,7 +152,9 @@ func NewModel() model {
 		attackConcurrency: 5,
 		attackGenCharset: "abcdefghijklmnopqrstuvwxyz0123456789",
 		attackGenMaxLen:  4,
-		attackFocusMax:   15, // URL, User, Wordlist, UserField, PassField, Regex, Concurrency, JSON, Delay, BatchSize, BatchDelay, ExpStatus, StatusIsSuccess, GenCharset, GenMaxLen
+		attackRandomUA:   true,
+		attackRandomIP:   true,
+		attackFocusMax:   18, // URL, User, Wordlist, UserField, PassField, Regex, Concurrency, JSON, Delay, BatchSize, BatchDelay, ExpStatus, StatusIsSuccess, GenCharset, GenMaxLen, ProxyList, RandomUA, RandomIP
 	}
 }
 
@@ -248,7 +254,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, waitForAttack(m.attackChan)
 		} else if msg.Status == "Success" {
 			m.attackActive = false
-			m.attackResult = fmt.Sprintf("[+] SUCCESS! Password found: %s\n[+] Final URL reached: %s", msg.Password, msg.FinalURL)
+			
+			resStr := fmt.Sprintf("[+] SUCCESS! Password found: %s", msg.Password)
+			if msg.FinalURL != "" && msg.FinalURL != m.attackTargetURL {
+				resStr += fmt.Sprintf("\n[+] Redirected to: %s", msg.FinalURL)
+			}
+			if msg.ResponseBody != "" {
+				resStr += fmt.Sprintf("\n[+] Response: %s", msg.ResponseBody)
+			}
+			m.attackResult = resStr
 			m.attackStatus = ""
 		} else if msg.Status == "Failed" {
 			m.attackActive = false
@@ -396,22 +410,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case attackScreen:
 			if m.attackActive {
 				if msg.String() == "ctrl+c" {
-					return m, tea.Quit
+					if m.attackCancel != nil {
+						close(m.attackCancel)
+						m.attackCancel = nil
+					}
+					m.attackActive = false
+					m.attackResult = "[-] Attack cancelled by user."
+					m.attackStatus = ""
+					return m, nil
 				}
 				return m, nil
 			}
 
 			switch msg.String() {
-			case "q", "ctrl+c":
+			case "ctrl+c":
 				return m, tea.Quit
 			case "esc":
 				m.screen = listScreen
-			case "up", "k", "shift+tab":
+			case "up", "shift+tab":
 				m.saveAttackField()
 				m.attackFocus--
 				if m.attackFocus < 0 { m.attackFocus = m.attackFocusMax - 1 }
 				m.loadAttackField()
-			case "down", "j", "tab":
+			case "down", "tab":
 				m.saveAttackField()
 				m.attackFocus++
 				if m.attackFocus >= m.attackFocusMax { m.attackFocus = 0 }
@@ -421,6 +442,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.attackIsJSON = !m.attackIsJSON
 				} else if m.attackFocus == 12 { // StatusIsSuccess toggle
 					m.attackStatusIsSuccess = !m.attackStatusIsSuccess
+				} else if m.attackFocus == 16 { // RandomUA toggle
+					m.attackRandomUA = !m.attackRandomUA
+				} else if m.attackFocus == 17 { // RandomIP toggle
+					m.attackRandomIP = !m.attackRandomIP
 				} else {
 					if m.editCursor <= len(m.editBuf) {
 						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append([]rune{' '}, m.editBuf[m.editCursor:]...)...)
@@ -433,6 +458,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.attackResult = ""
 				m.attackStatus = "Starting attack..."
 				m.attackChan = make(chan proxy.AttackProgressMsg)
+				m.attackCancel = make(chan bool)
 				config := proxy.AttackConfig{
 					TargetURL:    m.attackTargetURL,
 					Username:     m.attackUser,
@@ -449,8 +475,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					StatusIsSuccess: m.attackStatusIsSuccess,
 					GenCharset:     m.attackGenCharset,
 					GenMaxLen:      m.attackGenMaxLen,
+					ProxyList:      m.attackProxyList,
+					RandomUA:       m.attackRandomUA,
+					RandomIP:       m.attackRandomIP,
 				}
-				go proxy.RunBruteForceUI(config, m.attackChan)
+				go proxy.RunBruteForceUI(config, m.attackChan, m.attackCancel)
 				return m, waitForAttack(m.attackChan)
 			case "backspace":
 				if m.editCursor > 0 {
@@ -857,6 +886,9 @@ func (m model) attackView() string {
 		{"Success ifSt", fmt.Sprintf("%v", m.attackStatusIsSuccess), 12},
 		{"Gen Charset ", m.attackGenCharset, 13},
 		{"Gen Max Len ", fmt.Sprintf("%d", m.attackGenMaxLen), 14},
+		{"Proxy List  ", m.attackProxyList, 15},
+		{"Random UA   ", fmt.Sprintf("%v", m.attackRandomUA), 16},
+		{"Random IP   ", fmt.Sprintf("%v", m.attackRandomIP), 17},
 	}
 
 	for _, f := range fields {
@@ -1095,6 +1127,7 @@ func (m *model) saveAttackField() {
 		var ml int
 		fmt.Sscanf(string(m.editBuf), "%d", &ml)
 		if ml > 0 { m.attackGenMaxLen = ml }
+	case 15: m.attackProxyList = string(m.editBuf)
 	}
 }
 
@@ -1116,6 +1149,9 @@ func (m *model) loadAttackField() {
 	case 12: s = fmt.Sprintf("%v", m.attackStatusIsSuccess)
 	case 13: s = m.attackGenCharset
 	case 14: s = fmt.Sprintf("%d", m.attackGenMaxLen)
+	case 15: s = m.attackProxyList
+	case 16: s = fmt.Sprintf("%v", m.attackRandomUA)
+	case 17: s = fmt.Sprintf("%v", m.attackRandomIP)
 	}
 	m.editBuf = []rune(s)
 	m.editCursor = len(m.editBuf)
