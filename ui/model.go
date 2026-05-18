@@ -138,6 +138,7 @@ type model struct {
 	attackChan         chan proxy.AttackProgressMsg
 	attackCancel       chan bool
 	attackFocusMax     int // dynamic max focus based on fields
+	attackType         string // "Sniper", "Battering Ram"
 
 	// Interactive field selection
 	attackAvailableFields []string
@@ -162,7 +163,8 @@ func NewModel() model {
 		attackGenMaxLen:  4,
 		attackRandomUA:   true,
 		attackRandomIP:   true,
-		attackFocusMax:   18, // URL, User, Wordlist, UserField, PassField, Regex, Concurrency, JSON, Delay, BatchSize, BatchDelay, ExpStatus, StatusIsSuccess, GenCharset, GenMaxLen, ProxyList, RandomUA, RandomIP
+		attackFocusMax:   19, // URL, User, Wordlist, UserField, PassField, Regex, Concurrency, JSON, Delay, BatchSize, BatchDelay, ExpStatus, StatusIsSuccess, GenCharset, GenMaxLen, ProxyList, RandomUA, RandomIP, AttackType
+		attackType:        "Sniper",
 	}
 }
 
@@ -525,6 +527,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					ProxyList:      m.attackProxyList,
 					RandomUA:       m.attackRandomUA,
 					RandomIP:       m.attackRandomIP,
+					AttackType:     m.attackType,
 				}
 				go proxy.RunBruteForceUI(config, m.attackChan, m.attackCancel)
 				return m, waitForAttack(m.attackChan)
@@ -550,6 +553,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.attackPassField = m.attackAvailableFields[m.attackPassFieldIndex]
 					m.editBuf = []rune(m.attackPassField)
 					m.editCursor = len(m.editBuf)
+				} else if m.attackFocus == 18 {
+					if m.attackType == "Sniper" {
+						m.attackType = "Battering Ram"
+					} else {
+						m.attackType = "Sniper"
+					}
+					m.editBuf = []rune(m.attackType)
+					m.editCursor = len(m.editBuf)
 				} else if m.editCursor > 0 {
 					m.editCursor--
 				}
@@ -566,6 +577,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.attackPassField = m.attackAvailableFields[m.attackPassFieldIndex]
 					m.editBuf = []rune(m.attackPassField)
 					m.editCursor = len(m.editBuf)
+				} else if m.attackFocus == 18 {
+					if m.attackType == "Sniper" {
+						m.attackType = "Battering Ram"
+					} else {
+						m.attackType = "Sniper"
+					}
+					m.editBuf = []rune(m.attackType)
+					m.editCursor = len(m.editBuf)
 				} else if m.editCursor < len(m.editBuf) {
 					m.editCursor++
 				}
@@ -574,6 +593,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Eğer "[MANUEL]" seçili değilse klavyeden yazı yazılmasını engelle
 					if m.attackFocus == 3 && m.attackUserField != "[MANUEL]" { return m, nil }
 					if m.attackFocus == 4 && m.attackPassField != "[MANUEL]" { return m, nil }
+					if m.attackFocus == 18 { return m, nil }
 
 					if len(msg.Runes) > 0 {
 						m.editBuf = append(m.editBuf[:m.editCursor:m.editCursor], append(msg.Runes, m.editBuf[m.editCursor:]...)...)
@@ -1023,6 +1043,7 @@ func (m model) attackView() string {
 		{"Proxy List  ", m.attackProxyList, 15},
 		{"Random UA   ", fmt.Sprintf("%v", m.attackRandomUA), 16},
 		{"Random IP   ", fmt.Sprintf("%v", m.attackRandomIP), 17},
+		{"Attack Type ", m.attackType, 18},
 	}
 
 	for _, f := range fields {
@@ -1273,6 +1294,7 @@ func (m *model) saveAttackField() {
 		fmt.Sscanf(string(m.editBuf), "%d", &ml)
 		if ml > 0 { m.attackGenMaxLen = ml }
 	case 15: m.attackProxyList = string(m.editBuf)
+	case 18: m.attackType = string(m.editBuf)
 	}
 }
 
@@ -1297,6 +1319,7 @@ func (m *model) loadAttackField() {
 	case 15: s = m.attackProxyList
 	case 16: s = fmt.Sprintf("%v", m.attackRandomUA)
 	case 17: s = fmt.Sprintf("%v", m.attackRandomIP)
+	case 18: s = m.attackType
 	}
 	m.editBuf = []rune(s)
 	m.editCursor = len(m.editBuf)

