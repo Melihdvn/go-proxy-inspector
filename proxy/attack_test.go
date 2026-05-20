@@ -93,3 +93,40 @@ func TestGenerateJobsSniper(t *testing.T) {
 		t.Errorf("Job 3 payload incorrect: %v", list[2].payloadMap)
 	}
 }
+
+func TestGenerateJobsClusterBomb(t *testing.T) {
+	engine := NewTemplateEngine("http://example.com/login", nil, "user=§usr§&pass=§pwd§")
+	payloads1 := []string{"u1", "u2"}
+	payloads2 := []string{"p1", "p2"}
+
+	jobsChan := make(chan attackJob, 10)
+	cancelChan := make(chan bool)
+
+	GenerateJobs(engine, payloads1, payloads2, "Cluster Bomb", jobsChan, cancelChan)
+	close(jobsChan)
+
+	var list []attackJob
+	for j := range jobsChan {
+		list = append(list, j)
+	}
+
+	if len(list) != 4 {
+		t.Fatalf("expected 4 jobs for Cluster Bomb, got %d", len(list))
+	}
+
+	expectedCombos := []struct {
+		usr string
+		pwd string
+	}{
+		{"u1", "p1"},
+		{"u1", "p2"},
+		{"u2", "p1"},
+		{"u2", "p2"},
+	}
+
+	for i, exp := range expectedCombos {
+		if list[i].payloadMap[0] != exp.usr || list[i].payloadMap[1] != exp.pwd {
+			t.Errorf("Job %d incorrect payload: %v", i, list[i].payloadMap)
+		}
+	}
+}

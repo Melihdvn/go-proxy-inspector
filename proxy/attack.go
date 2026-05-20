@@ -44,7 +44,10 @@ type AttackConfig struct {
 	ResetCount     int    // Rate limit bypass: inject reset job every N attempts
 	ResetUser      string // User to use for reset
 	ResetPass      string // Password to use for reset
-	AttackType     string // "Sniper", "Battering Ram"
+	AttackType     string // "Sniper", "Battering Ram", "Pitchfork", "Cluster Bomb"
+	Wordlist2      string
+	GenCharset2    string
+	GenMaxLen2     int
 }
 
 var userAgents = []string{
@@ -376,6 +379,76 @@ func GenerateJobs(engine *TemplateEngine, payloads1 []string, payloads2 []string
 				password:   p,
 			}
 		}
+
+	case "Pitchfork":
+		maxLen := len(payloads1)
+		if len(payloads2) < maxLen {
+			maxLen = len(payloads2)
+		}
+		for i := 0; i < maxLen; i++ {
+			if isCancelled() {
+				return
+			}
+			attemptCount++
+			payloadMap := make(map[int]string)
+			var displayParts []string
+			for j := 0; j < P; j++ {
+				var p string
+				if j%2 == 0 {
+					p = payloads1[i]
+				} else {
+					p = payloads2[i]
+				}
+				payloadMap[j] = p
+				displayParts = append(displayParts, p)
+			}
+			jobsChan <- attackJob{
+				payloadMap: payloadMap,
+				attempt:    attemptCount,
+				password:   strings.Join(displayParts, ", "),
+			}
+		}
+
+	case "Cluster Bomb":
+		assignedSets := make([][]string, P)
+		for j := 0; j < P; j++ {
+			if j%2 == 0 {
+				assignedSets[j] = payloads1
+			} else {
+				assignedSets[j] = payloads2
+			}
+			if len(assignedSets[j]) == 0 {
+				assignedSets[j] = []string{""}
+			}
+		}
+
+		var cartesian func(currentMap map[int]string, currentDepth int)
+		cartesian = func(currentMap map[int]string, currentDepth int) {
+			if isCancelled() {
+				return
+			}
+			if currentDepth == P {
+				attemptCount++
+				mCopy := make(map[int]string)
+				var displayParts []string
+				for k := 0; k < P; k++ {
+					mCopy[k] = currentMap[k]
+					displayParts = append(displayParts, currentMap[k])
+				}
+				jobsChan <- attackJob{
+					payloadMap: mCopy,
+					attempt:    attemptCount,
+					password:   strings.Join(displayParts, ", "),
+				}
+				return
+			}
+
+			for _, p := range assignedSets[currentDepth] {
+				currentMap[currentDepth] = p
+				cartesian(currentMap, currentDepth+1)
+			}
+		}
+		cartesian(make(map[int]string), 0)
 	}
 }
 
@@ -391,6 +464,12 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 	}
 	if config.GenMaxLen <= 0 {
 		config.GenMaxLen = 4
+	}
+	if config.GenCharset2 == "" {
+		config.GenCharset2 = "abcdefghijklmnopqrstuvwxyz0123456789"
+	}
+	if config.GenMaxLen2 <= 0 {
+		config.GenMaxLen2 = 4
 	}
 	if config.AttackType == "" {
 		config.AttackType = "Sniper"
@@ -409,6 +488,12 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 	payloads1, err := LoadPayloads(config.Wordlist, config.GenCharset, config.GenMaxLen)
 	if err != nil {
 		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error loading Payload Set 1: %v", err)}
+		return
+	}
+
+	payloads2, err := LoadPayloads(config.Wordlist2, config.GenCharset2, config.GenMaxLen2)
+	if err != nil {
+		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error loading Payload Set 2: %v", err)}
 		return
 	}
 
@@ -689,7 +774,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 
 	go func() {
 		defer close(jobs)
-		GenerateJobs(engine, payloads1, nil, config.AttackType, jobs, cancelChan)
+		GenerateJobs(engine, payloads1, payloads2, config.AttackType, jobs, cancelChan)
 	}()
 
 	wg.Wait()

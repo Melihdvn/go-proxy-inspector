@@ -139,6 +139,9 @@ type model struct {
 	attackCancel       chan bool
 	attackFocusMax     int // dynamic max focus based on fields
 	attackType         string // "Sniper", "Battering Ram"
+	attackWordlist2    string
+	attackGenCharset2  string
+	attackGenMaxLen2   int
 
 	// Interactive field selection
 	attackAvailableFields []string
@@ -163,8 +166,10 @@ func NewModel() model {
 		attackGenMaxLen:  4,
 		attackRandomUA:   true,
 		attackRandomIP:   true,
-		attackFocusMax:   19, // URL, User, Wordlist, UserField, PassField, Regex, Concurrency, JSON, Delay, BatchSize, BatchDelay, ExpStatus, StatusIsSuccess, GenCharset, GenMaxLen, ProxyList, RandomUA, RandomIP, AttackType
+		attackFocusMax:   22, // URL, User, Wordlist, UserField, PassField, Regex, Concurrency, JSON, Delay, BatchSize, BatchDelay, ExpStatus, StatusIsSuccess, GenCharset, GenMaxLen, ProxyList, RandomUA, RandomIP, AttackType, Wordlist 2, Gen Charset 2, Gen MaxLen 2
 		attackType:        "Sniper",
+		attackGenCharset2: "abcdefghijklmnopqrstuvwxyz0123456789",
+		attackGenMaxLen2:  4,
 	}
 }
 
@@ -528,6 +533,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					RandomUA:       m.attackRandomUA,
 					RandomIP:       m.attackRandomIP,
 					AttackType:     m.attackType,
+					Wordlist2:      m.attackWordlist2,
+					GenCharset2:    m.attackGenCharset2,
+					GenMaxLen2:     m.attackGenMaxLen2,
 				}
 				go proxy.RunBruteForceUI(config, m.attackChan, m.attackCancel)
 				return m, waitForAttack(m.attackChan)
@@ -554,11 +562,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editBuf = []rune(m.attackPassField)
 					m.editCursor = len(m.editBuf)
 				} else if m.attackFocus == 18 {
-					if m.attackType == "Sniper" {
-						m.attackType = "Battering Ram"
-					} else {
-						m.attackType = "Sniper"
+					modes := []string{"Sniper", "Battering Ram", "Pitchfork", "Cluster Bomb"}
+					idx := -1
+					for i, mode := range modes {
+						if mode == m.attackType {
+							idx = i
+							break
+						}
 					}
+					idx = (idx - 1 + len(modes)) % len(modes)
+					m.attackType = modes[idx]
 					m.editBuf = []rune(m.attackType)
 					m.editCursor = len(m.editBuf)
 				} else if m.editCursor > 0 {
@@ -578,11 +591,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editBuf = []rune(m.attackPassField)
 					m.editCursor = len(m.editBuf)
 				} else if m.attackFocus == 18 {
-					if m.attackType == "Sniper" {
-						m.attackType = "Battering Ram"
-					} else {
-						m.attackType = "Sniper"
+					modes := []string{"Sniper", "Battering Ram", "Pitchfork", "Cluster Bomb"}
+					idx := -1
+					for i, mode := range modes {
+						if mode == m.attackType {
+							idx = i
+							break
+						}
 					}
+					idx = (idx + 1) % len(modes)
+					m.attackType = modes[idx]
 					m.editBuf = []rune(m.attackType)
 					m.editCursor = len(m.editBuf)
 				} else if m.editCursor < len(m.editBuf) {
@@ -1044,6 +1062,9 @@ func (m model) attackView() string {
 		{"Random UA   ", fmt.Sprintf("%v", m.attackRandomUA), 16},
 		{"Random IP   ", fmt.Sprintf("%v", m.attackRandomIP), 17},
 		{"Attack Type ", m.attackType, 18},
+		{"Wordlist 2  ", m.attackWordlist2, 19},
+		{"Gen Charset2", m.attackGenCharset2, 20},
+		{"Gen MaxLen 2", fmt.Sprintf("%d", m.attackGenMaxLen2), 21},
 	}
 
 	for _, f := range fields {
@@ -1295,6 +1316,12 @@ func (m *model) saveAttackField() {
 		if ml > 0 { m.attackGenMaxLen = ml }
 	case 15: m.attackProxyList = string(m.editBuf)
 	case 18: m.attackType = string(m.editBuf)
+	case 19: m.attackWordlist2 = string(m.editBuf)
+	case 20: m.attackGenCharset2 = string(m.editBuf)
+	case 21:
+		var ml int
+		fmt.Sscanf(string(m.editBuf), "%d", &ml)
+		if ml > 0 { m.attackGenMaxLen2 = ml }
 	}
 }
 
@@ -1320,6 +1347,9 @@ func (m *model) loadAttackField() {
 	case 16: s = fmt.Sprintf("%v", m.attackRandomUA)
 	case 17: s = fmt.Sprintf("%v", m.attackRandomIP)
 	case 18: s = m.attackType
+	case 19: s = m.attackWordlist2
+	case 20: s = m.attackGenCharset2
+	case 21: s = fmt.Sprintf("%d", m.attackGenMaxLen2)
 	}
 	m.editBuf = []rune(s)
 	m.editCursor = len(m.editBuf)
