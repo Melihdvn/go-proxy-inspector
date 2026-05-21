@@ -1,6 +1,10 @@
 package proxy
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -128,5 +132,64 @@ func TestGenerateJobsClusterBomb(t *testing.T) {
 		if list[i].payloadMap[0] != exp.usr || list[i].payloadMap[1] != exp.pwd {
 			t.Errorf("Job %d incorrect payload: %v", i, list[i].payloadMap)
 		}
+	}
+}
+
+func TestStopOnSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		bodyStr := string(bodyBytes)
+		if strings.Contains(bodyStr, "secretpass") {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("success response"))
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("incorrect password"))
+		}
+	}))
+	defer server.Close()
+
+	config := AttackConfig{
+		Method:        "POST",
+		TargetURL:     server.URL,
+		OriginalBody:  "pass=§pass§",
+		Wordlist:      "", // We will use temp file instead of NUM:
+		Concurrency:   5,
+		StopOnSuccess: true,
+	}
+
+	tmpFile, err := os.CreateTemp("", "wordlist")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	passwords := []string{"one", "two", "secretpass", "three", "four", "five"}
+	for _, p := range passwords {
+		tmpFile.WriteString(p + "\n")
+	}
+	tmpFile.Close()
+
+	config.Wordlist = tmpFile.Name()
+
+	updateChan := make(chan AttackProgressMsg)
+	cancelChan := make(chan bool)
+
+	go RunBruteForceUI(config, updateChan, cancelChan)
+
+	var successMsg *AttackProgressMsg
+	for msg := range updateChan {
+		if msg.Status == "Success" {
+			m := msg
+			successMsg = &m
+		}
+	}
+
+	if successMsg == nil {
+		t.Fatal("expected success message, but got none")
+	}
+
+	if successMsg.Password != "secretpass" {
+		t.Errorf("expected success password 'secretpass', got %q", successMsg.Password)
 	}
 }

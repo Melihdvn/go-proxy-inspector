@@ -48,6 +48,7 @@ type AttackConfig struct {
 	Wordlist2      string
 	GenCharset2    string
 	GenMaxLen2     int
+	StopOnSuccess  bool
 }
 
 var userAgents = []string{
@@ -507,6 +508,23 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 	results := make(chan attackResult)
 	done := make(chan bool)
 
+	localCancel := make(chan bool)
+	var cancelOnce sync.Once
+	triggerLocalCancel := func() {
+		cancelOnce.Do(func() {
+			close(localCancel)
+		})
+	}
+
+	combinedCancel := make(chan bool)
+	go func() {
+		select {
+		case <-cancelChan:
+		case <-localCancel:
+		}
+		close(combinedCancel)
+	}()
+
 	var wg sync.WaitGroup
 
 	var proxies []*url.URL
@@ -566,7 +584,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 			defer wg.Done()
 			for job := range jobs {
 				select {
-				case <-cancelChan:
+				case <-combinedCancel:
 					return
 				default:
 				}
@@ -598,7 +616,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 				success := false
 				for retry := 0; retry < 3; retry++ {
 					select {
-					case <-cancelChan:
+					case <-combinedCancel:
 						return
 					default:
 					}
@@ -700,7 +718,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 				}
 
 				select {
-				case <-cancelChan:
+				case <-combinedCancel:
 					return
 				case results <- res:
 				}
@@ -711,7 +729,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 						jitter = (time.Now().Nanosecond() % (config.DelayMs / 5)) - (config.DelayMs / 10)
 					}
 					select {
-					case <-cancelChan:
+					case <-combinedCancel:
 						return
 					case <-time.After(time.Duration(config.DelayMs+jitter) * time.Millisecond):
 					}
@@ -719,7 +737,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 				if config.BatchSize > 0 && job.attempt%config.BatchSize == 0 {
 					if config.BatchDelayMs > 0 {
 						select {
-						case <-cancelChan:
+						case <-combinedCancel:
 							return
 						case <-time.After(time.Duration(config.BatchDelayMs) * time.Millisecond):
 						}
@@ -746,6 +764,9 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 			if res.success && finalResult == nil {
 				fr := res
 				finalResult = &fr
+				if config.StopOnSuccess {
+					triggerLocalCancel()
+				}
 				// Force immediate update to UI on success
 				updateChan <- AttackProgressMsg{
 					AttemptCount:  res.attempt,
@@ -774,7 +795,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 
 	go func() {
 		defer close(jobs)
-		GenerateJobs(engine, payloads1, payloads2, config.AttackType, jobs, cancelChan)
+		GenerateJobs(engine, payloads1, payloads2, config.AttackType, jobs, combinedCancel)
 	}()
 
 	wg.Wait()
