@@ -99,6 +99,7 @@ type model struct {
 	height       int
 	screen       screen
 	detailScroll int
+	attackScroll int
 
 	filterMode bool
 	filterBuf  string
@@ -247,6 +248,21 @@ func (m model) filteredEvents() []proxy.Event {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	prevScreen := m.screen
+	var cmd tea.Cmd
+	m, cmd = m.updateInternal(msg)
+
+	if m.screen == attackScreen && prevScreen != attackScreen {
+		m.attackScroll = 0
+	}
+
+	if m.screen == attackScreen {
+		m.adjustAttackScroll()
+	}
+	return m, cmd
+}
+
+func (m model) updateInternal(msg tea.Msg) (model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -1190,9 +1206,9 @@ func getAttackFieldHelp(focus int) string {
 }
 
 func (m model) attackView() string {
-	var leftSide strings.Builder
-	leftSide.WriteString(styleTitle.Render("BRUTE FORCE ATTACK TOOL") + "\n")
-	leftSide.WriteString(strings.Repeat("─", 50) + "\n")
+	var topSection strings.Builder
+	topSection.WriteString(styleTitle.Render("BRUTE FORCE ATTACK TOOL") + "\n")
+	topSection.WriteString(strings.Repeat("─", 50) + "\n")
 
 	userFieldDisplay := m.attackUserField
 	if m.attackFocus == 3 && len(m.attackAvailableFields) > 1 {
@@ -1236,63 +1252,85 @@ func (m model) attackView() string {
 		}
 	}
 
+	var formLines []string
 	// 1. TARGET CONFIG
-	leftSide.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("┌── TARGET CONFIG ────────────────────────────────") + "\n")
-	leftSide.WriteString(renderField("Target URL  ", m.attackTargetURL, 0) + "\n")
-	leftSide.WriteString(renderField("Method      ", m.attackMethod, 1) + "\n")
-	leftSide.WriteString(renderField("User Default", m.attackUser, 2) + "\n")
-	leftSide.WriteString(renderField("User Field  ", userFieldDisplay, 3) + "\n")
-	leftSide.WriteString(renderField("Pass Field  ", passFieldDisplay, 4) + "\n")
-	leftSide.WriteString(renderField("JSON Mode   ", fmt.Sprintf("%v", m.attackIsJSON), 5) + "\n")
-	leftSide.WriteString(renderField("Concurrent  ", fmt.Sprintf("%d", m.attackConcurrency), 6) + "\n")
+	formLines = append(formLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("┌── TARGET CONFIG ────────────────────────────────"))
+	formLines = append(formLines, renderField("Target URL  ", m.attackTargetURL, 0))
+	formLines = append(formLines, renderField("Method      ", m.attackMethod, 1))
+	formLines = append(formLines, renderField("User Default", m.attackUser, 2))
+	formLines = append(formLines, renderField("User Field  ", userFieldDisplay, 3))
+	formLines = append(formLines, renderField("Pass Field  ", passFieldDisplay, 4))
+	formLines = append(formLines, renderField("JSON Mode   ", fmt.Sprintf("%v", m.attackIsJSON), 5))
+	formLines = append(formLines, renderField("Concurrent  ", fmt.Sprintf("%d", m.attackConcurrency), 6))
 
 	// 2. ATTACK STRATEGY
-	leftSide.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── ATTACK STRATEGY ──────────────────────────────") + "\n")
-	leftSide.WriteString(renderField("Attack Type ", attackTypeDisplay, 7) + "\n")
-	leftSide.WriteString(renderField("Success RE  ", m.attackSuccessRegex, 8) + "\n")
-	leftSide.WriteString(renderField("Expected St ", fmt.Sprintf("%d", m.attackExpectedStatus), 9) + "\n")
-	leftSide.WriteString(renderField("Success ifSt", fmt.Sprintf("%v", m.attackStatusIsSuccess), 10) + "\n")
-	leftSide.WriteString(renderField("Stop Success", fmt.Sprintf("%v", m.attackStopOnSuccess), 11) + "\n")
+	formLines = append(formLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── ATTACK STRATEGY ──────────────────────────────"))
+	formLines = append(formLines, renderField("Attack Type ", attackTypeDisplay, 7))
+	formLines = append(formLines, renderField("Success RE  ", m.attackSuccessRegex, 8))
+	formLines = append(formLines, renderField("Expected St ", fmt.Sprintf("%d", m.attackExpectedStatus), 9))
+	formLines = append(formLines, renderField("Success ifSt", fmt.Sprintf("%v", m.attackStatusIsSuccess), 10))
+	formLines = append(formLines, renderField("Stop Success", fmt.Sprintf("%v", m.attackStopOnSuccess), 11))
 
 	// 3. PAYLOAD SET 1 (USER)
-	leftSide.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── PAYLOAD SET 1 (USER) ──────────────────────────") + "\n")
-	leftSide.WriteString(renderField("Wordlist 1  ", m.attackWordlist, 12) + "\n")
-	leftSide.WriteString(renderField("Gen Charset1", m.attackGenCharset, 13) + "\n")
-	leftSide.WriteString(renderField("Gen MaxLen 1", fmt.Sprintf("%d", m.attackGenMaxLen), 14) + "\n")
+	formLines = append(formLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── PAYLOAD SET 1 (USER) ──────────────────────────"))
+	formLines = append(formLines, renderField("Wordlist 1  ", m.attackWordlist, 12))
+	formLines = append(formLines, renderField("Gen Charset1", m.attackGenCharset, 13))
+	formLines = append(formLines, renderField("Gen MaxLen 1", fmt.Sprintf("%d", m.attackGenMaxLen), 14))
 
 	// 4. PAYLOAD SET 2 (PASS)
-	leftSide.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── PAYLOAD SET 2 (PASS) ──────────────────────────") + "\n")
-	leftSide.WriteString(renderField("Wordlist 2  ", m.attackWordlist2, 15) + "\n")
-	leftSide.WriteString(renderField("Gen Charset2", m.attackGenCharset2, 16) + "\n")
-	leftSide.WriteString(renderField("Gen MaxLen 2", fmt.Sprintf("%d", m.attackGenMaxLen2), 17) + "\n")
+	formLines = append(formLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── PAYLOAD SET 2 (PASS) ──────────────────────────"))
+	formLines = append(formLines, renderField("Wordlist 2  ", m.attackWordlist2, 15))
+	formLines = append(formLines, renderField("Gen Charset2", m.attackGenCharset2, 16))
+	formLines = append(formLines, renderField("Gen MaxLen 2", fmt.Sprintf("%d", m.attackGenMaxLen2), 17))
 
-	// 5. RATE LIMITS & PROXY
-	leftSide.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── RATE LIMITS & TUNING ──────────────────────────") + "\n")
-	leftSide.WriteString(renderField("Delay (ms)  ", fmt.Sprintf("%d", m.attackDelayMs), 18) + "\n")
-	leftSide.WriteString(renderField("Batch Size  ", fmt.Sprintf("%d", m.attackBatchSize), 19) + "\n")
-	leftSide.WriteString(renderField("Batch Delay ", fmt.Sprintf("%d", m.attackBatchDelayMs), 20) + "\n")
-	leftSide.WriteString(renderField("Random UA   ", fmt.Sprintf("%v", m.attackRandomUA), 21) + "\n")
-	leftSide.WriteString(renderField("Random IP   ", fmt.Sprintf("%v", m.attackRandomIP), 22) + "\n")
-	leftSide.WriteString(renderField("Proxy List  ", m.attackProxyList, 23) + "\n")
+	// 5. RATE LIMITS & TUNING
+	formLines = append(formLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── RATE LIMITS & TUNING ──────────────────────────"))
+	formLines = append(formLines, renderField("Delay (ms)  ", fmt.Sprintf("%d", m.attackDelayMs), 18))
+	formLines = append(formLines, renderField("Batch Size  ", fmt.Sprintf("%d", m.attackBatchSize), 19))
+	formLines = append(formLines, renderField("Batch Delay ", fmt.Sprintf("%d", m.attackBatchDelayMs), 20))
+	formLines = append(formLines, renderField("Random UA   ", fmt.Sprintf("%v", m.attackRandomUA), 21))
+	formLines = append(formLines, renderField("Random IP   ", fmt.Sprintf("%v", m.attackRandomIP), 22))
+	formLines = append(formLines, renderField("Proxy List  ", m.attackProxyList, 23))
 
 	// 6. BYPASS & RESET
-	leftSide.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── BYPASS & RESET ───────────────────────────────") + "\n")
-	leftSide.WriteString(renderField("Reset Count ", fmt.Sprintf("%d", m.attackResetCount), 24) + "\n")
-	leftSide.WriteString(renderField("Reset User  ", m.attackResetUser, 25) + "\n")
-	leftSide.WriteString(renderField("Reset Pass  ", m.attackResetPass, 26) + "\n")
-	leftSide.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("└─────────────────────────────────────────────────") + "\n")
+	formLines = append(formLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("├── BYPASS & RESET ───────────────────────────────"))
+	formLines = append(formLines, renderField("Reset Count ", fmt.Sprintf("%d", m.attackResetCount), 24))
+	formLines = append(formLines, renderField("Reset User  ", m.attackResetUser, 25))
+	formLines = append(formLines, renderField("Reset Pass  ", m.attackResetPass, 26))
+	formLines = append(formLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#CC66FF")).Bold(true).Render("└─────────────────────────────────────────────────"))
 
-	leftSide.WriteString(strings.Repeat("─", 50) + "\n")
-	
-	// Payload Preview
-	leftSide.WriteString(styleDim.Render("Payload Preview:") + "\n")
+	formLines = append(formLines, styleDim.Render("Payload Preview:"))
 	preview := m.attackOriginalBody
 	if preview == "" {
 		preview = "(Auto-generated based on fields)"
 	} else if len(preview) > 150 {
 		preview = preview[:147] + "..."
 	}
-	leftSide.WriteString("  " + preview + "\n")
+	formLines = append(formLines, "  "+preview)
+
+	formHeight := m.getFormHeight()
+
+	// Adjust m.attackScroll bound check to be double-safe during View
+	if m.attackScroll < 0 {
+		m.attackScroll = 0
+	}
+	maxScroll := len(formLines) - formHeight
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.attackScroll > maxScroll {
+		m.attackScroll = maxScroll
+	}
+
+	end := m.attackScroll + formHeight
+	if end > len(formLines) {
+		end = len(formLines)
+	}
+
+	var formSB strings.Builder
+	for _, l := range formLines[m.attackScroll:end] {
+		formSB.WriteString(l + "\n")
+	}
 
 	// Help panel on the right
 	rightSideHelp := getAttackFieldHelp(m.attackFocus)
@@ -1304,12 +1342,13 @@ func (m model) attackView() string {
 
 	helpBox := helpStyle.Render(rightSideHelp)
 
-	// Combine left and right side horizontally
+	// Combine form and right side help box horizontally
 	var mainLayout string
 	if m.width >= 95 {
-		mainLayout = lipgloss.JoinHorizontal(lipgloss.Top, leftSide.String(), "\n"+helpBox)
+		scrolledFormAndHelp := lipgloss.JoinHorizontal(lipgloss.Top, formSB.String(), "\n"+helpBox)
+		mainLayout = topSection.String() + scrolledFormAndHelp
 	} else {
-		mainLayout = leftSide.String() + "\n" + helpBox
+		mainLayout = topSection.String() + formSB.String() + "\n" + helpBox
 	}
 
 	var finalSB strings.Builder
@@ -1321,7 +1360,21 @@ func (m model) attackView() string {
 		finalSB.WriteString(styleDim.Render(fmt.Sprintf("%-5s | %-20s | %-6s | %-6s", "ID", "Password", "Status", "Size")) + "\n")
 		finalSB.WriteString(styleDim.Render(strings.Repeat("─", 62)) + "\n")
 		
-		for _, h := range m.attackHistory {
+		maxHistoryRows := 5
+		if m.height < 35 {
+			maxHistoryRows = 3
+		}
+		if m.height < 25 {
+			maxHistoryRows = 1
+		}
+		
+		shownHistoryCount := len(m.attackHistory)
+		if shownHistoryCount > maxHistoryRows {
+			shownHistoryCount = maxHistoryRows
+		}
+
+		for i := 0; i < shownHistoryCount; i++ {
+			h := m.attackHistory[i]
 			pass := h.Password
 			if len(pass) > 20 { pass = pass[:17] + "..." }
 			
@@ -1630,4 +1683,90 @@ func (m *model) loadAttackField() {
 	}
 	m.editBuf = []rune(s)
 	m.editCursor = len(m.editBuf)
+}
+
+func getFocusLine(focus int) int {
+	switch {
+	case focus >= 0 && focus <= 6:
+		return 1 + focus
+	case focus >= 7 && focus <= 11:
+		return 2 + focus
+	case focus >= 12 && focus <= 14:
+		return 3 + focus
+	case focus >= 15 && focus <= 17:
+		return 4 + focus
+	case focus >= 18 && focus <= 23:
+		return 5 + focus
+	case focus >= 24 && focus <= 26:
+		return 6 + focus
+	default:
+		return 0
+	}
+}
+
+func (m model) getAttackResultLines() int {
+	if m.attackActive {
+		return 1
+	}
+	if m.attackResult == "" {
+		return 1 // "Status: Waiting to start..."
+	}
+	return len(strings.Split(m.attackResult, "\n"))
+}
+
+func (m model) getFormHeight() int {
+	nonFormHeight := 2 // title + separator
+
+	// History/Live Feed
+	if m.attackActive || len(m.attackHistory) > 0 {
+		maxHistoryRows := 5
+		if m.height < 35 {
+			maxHistoryRows = 3
+		}
+		if m.height < 25 {
+			maxHistoryRows = 1
+		}
+		shownHistoryCount := len(m.attackHistory)
+		if shownHistoryCount > maxHistoryRows {
+			shownHistoryCount = maxHistoryRows
+		}
+		// 3 extra lines: header (1) + separator (1) + bottom border (1)
+		nonFormHeight += 3 + shownHistoryCount
+	}
+
+	// Status/Result lines
+	nonFormHeight += m.getAttackResultLines()
+
+	// Keys and separators
+	nonFormHeight += 4 // separator before history/status (1) + separator after status (1) + keys hint (1) + final newline (1)
+
+	// Help box if stacked vertically
+	if m.width < 95 {
+		rightSideHelp := getAttackFieldHelp(m.attackFocus)
+		helpBoxHeight := len(strings.Split(rightSideHelp, "\n")) + 2
+		nonFormHeight += helpBoxHeight
+	}
+	
+	formHeight := m.height - nonFormHeight
+	if formHeight < 5 {
+		formHeight = 5
+	}
+	return formHeight
+}
+
+func (m *model) adjustAttackScroll() {
+	formHeight := m.getFormHeight()
+	focusLine := getFocusLine(m.attackFocus)
+	
+	// Ensure focusLine is visible
+	if focusLine < m.attackScroll {
+		m.attackScroll = focusLine
+	} else if focusLine >= m.attackScroll + formHeight {
+		m.attackScroll = focusLine - formHeight + 1
+	}
+	
+	// Bound checks
+	if m.attackScroll < 0 {
+		m.attackScroll = 0
+	}
 }

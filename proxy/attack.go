@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -236,45 +237,168 @@ func InjectAutoMarkers(config *AttackConfig) {
 		return
 	}
 
-	// Inject in Body
-	if config.UserField != "[MANUEL]" && config.UserField != "" {
-		reForm := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]*)`, regexp.QuoteMeta(config.UserField)))
-		if reForm.MatchString(body) {
-			body = reForm.ReplaceAllString(body, fmt.Sprintf("${1}=§${2}§"))
+	method := strings.ToUpper(config.Method)
+	isGet := method == "GET" || method == "HEAD"
+
+	if isGet {
+		// Inject in TargetURL query parameters
+		hasUserParam := false
+		hasPassParam := false
+
+		if config.UserField != "[MANUEL]" && config.UserField != "" {
+			reForm := regexp.MustCompile(fmt.Sprintf(`([?&]%s)=([^&]*)`, regexp.QuoteMeta(config.UserField)))
+			if reForm.MatchString(config.TargetURL) {
+				config.TargetURL = reForm.ReplaceAllString(config.TargetURL, fmt.Sprintf("${1}=§${2}§"))
+				hasUserParam = true
+			}
+		}
+		if config.PassField != "[MANUEL]" && config.PassField != "" {
+			reForm := regexp.MustCompile(fmt.Sprintf(`([?&]%s)=([^&]*)`, regexp.QuoteMeta(config.PassField)))
+			if reForm.MatchString(config.TargetURL) {
+				config.TargetURL = reForm.ReplaceAllString(config.TargetURL, fmt.Sprintf("${1}=§${2}§"))
+				hasPassParam = true
+			}
+		}
+
+		// If query parameters weren't present in URL, append them
+		var appendParts []string
+		userVal := config.Username
+		if userVal == "" {
+			userVal = "admin"
+		}
+		if !hasUserParam && config.UserField != "[MANUEL]" && config.UserField != "" {
+			appendParts = append(appendParts, fmt.Sprintf("%s=§%s§", config.UserField, userVal))
+		}
+		if !hasPassParam && config.PassField != "[MANUEL]" && config.PassField != "" {
+			appendParts = append(appendParts, fmt.Sprintf("%s=§§", config.PassField))
+		}
+
+		if len(appendParts) > 0 {
+			separator := "?"
+			if strings.Contains(config.TargetURL, "?") {
+				separator = "&"
+			}
+			config.TargetURL += separator + strings.Join(appendParts, "&")
+		}
+	} else {
+		// POST / PUT etc: Inject in Body
+		if body == "" {
+			userVal := config.Username
+			if userVal == "" {
+				userVal = "admin"
+			}
+
+			if config.IsJSON {
+				var parts []string
+				if config.UserField != "[MANUEL]" && config.UserField != "" {
+					parts = append(parts, fmt.Sprintf(`"%s":"§%s§"`, config.UserField, userVal))
+				}
+				if config.PassField != "[MANUEL]" && config.PassField != "" {
+					parts = append(parts, fmt.Sprintf(`"%s":"§§"`, config.PassField))
+				}
+				if len(parts) > 0 {
+					body = "{" + strings.Join(parts, ",") + "}"
+				}
+			} else {
+				var parts []string
+				if config.UserField != "[MANUEL]" && config.UserField != "" {
+					parts = append(parts, fmt.Sprintf("%s=§%s§", config.UserField, userVal))
+				}
+				if config.PassField != "[MANUEL]" && config.PassField != "" {
+					parts = append(parts, fmt.Sprintf("%s=§§", config.PassField))
+				}
+				if len(parts) > 0 {
+					body = strings.Join(parts, "&")
+				}
+			}
 		} else {
-			reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]*)"`, regexp.QuoteMeta(config.UserField)))
-			body = reJson.ReplaceAllString(body, fmt.Sprintf(`"%s":"§${1}§"`, config.UserField))
-		}
-	}
+			if config.UserField != "[MANUEL]" && config.UserField != "" {
+				reForm := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]*)`, regexp.QuoteMeta(config.UserField)))
+				if reForm.MatchString(body) {
+					body = reForm.ReplaceAllString(body, fmt.Sprintf("${1}=§${2}§"))
+				} else {
+					reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]*)"`, regexp.QuoteMeta(config.UserField)))
+					body = reJson.ReplaceAllString(body, fmt.Sprintf(`"%s":"§${1}§"`, config.UserField))
+				}
+			}
 
-	if config.PassField != "[MANUEL]" && config.PassField != "" {
-		reForm := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]*)`, regexp.QuoteMeta(config.PassField)))
-		if reForm.MatchString(body) {
-			body = reForm.ReplaceAllString(body, fmt.Sprintf("${1}=§${2}§"))
-		} else {
-			reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]*)"`, regexp.QuoteMeta(config.PassField)))
-			body = reJson.ReplaceAllString(body, fmt.Sprintf(`"%s":"§${1}§"`, config.PassField))
+			if config.PassField != "[MANUEL]" && config.PassField != "" {
+				reForm := regexp.MustCompile(fmt.Sprintf(`(%s)=([^&]*)`, regexp.QuoteMeta(config.PassField)))
+				if reForm.MatchString(body) {
+					body = reForm.ReplaceAllString(body, fmt.Sprintf("${1}=§${2}§"))
+				} else {
+					reJson := regexp.MustCompile(fmt.Sprintf(`"%s"\s*:\s*"([^"]*)"`, regexp.QuoteMeta(config.PassField)))
+					body = reJson.ReplaceAllString(body, fmt.Sprintf(`"%s":"§${1}§"`, config.PassField))
+				}
+			}
 		}
-	}
-
-	config.OriginalBody = body
-
-	// Inject in TargetURL query parameters
-	if config.UserField != "[MANUEL]" && config.UserField != "" {
-		reForm := regexp.MustCompile(fmt.Sprintf(`([?&]%s)=([^&]*)`, regexp.QuoteMeta(config.UserField)))
-		if reForm.MatchString(config.TargetURL) {
-			config.TargetURL = reForm.ReplaceAllString(config.TargetURL, fmt.Sprintf("${1}=§${2}§"))
-		}
-	}
-	if config.PassField != "[MANUEL]" && config.PassField != "" {
-		reForm := regexp.MustCompile(fmt.Sprintf(`([?&]%s)=([^&]*)`, regexp.QuoteMeta(config.PassField)))
-		if reForm.MatchString(config.TargetURL) {
-			config.TargetURL = reForm.ReplaceAllString(config.TargetURL, fmt.Sprintf("${1}=§${2}§"))
-		}
+		config.OriginalBody = body
 	}
 }
 
 func LoadPayloads(wordlist string, charset string, maxLen int) ([]string, error) {
+	if strings.HasPrefix(wordlist, "NUM:") {
+		rangeStr := strings.TrimPrefix(wordlist, "NUM:")
+		stepVal := 1
+
+		rangeParts := strings.Split(rangeStr, ":")
+		if len(rangeParts) > 2 {
+			return nil, fmt.Errorf("invalid NUM range format: too many colons")
+		}
+		if len(rangeParts) == 2 {
+			stepStr := strings.TrimSpace(rangeParts[1])
+			s, err := strconv.Atoi(stepStr)
+			if err != nil || s <= 0 {
+				return nil, fmt.Errorf("invalid NUM step value: %v", stepStr)
+			}
+			stepVal = s
+			rangeStr = rangeParts[0]
+		}
+
+		parts := strings.Split(rangeStr, "-")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid NUM range format: must be NUM:min-max (e.g., NUM:1-100) or NUM:min-max:step")
+		}
+		startStr := strings.TrimSpace(parts[0])
+		endStr := strings.TrimSpace(parts[1])
+
+		startVal, err := strconv.Atoi(startStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid NUM start value: %v", err)
+		}
+		endVal, err := strconv.Atoi(endStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid NUM end value: %v", err)
+		}
+
+		width := 0
+		if strings.HasPrefix(startStr, "0") && len(startStr) > 1 {
+			width = len(startStr)
+		} else if strings.HasPrefix(endStr, "0") && len(endStr) > 1 {
+			width = len(endStr)
+		}
+
+		var list []string
+		if startVal <= endVal {
+			for i := startVal; i <= endVal; i += stepVal {
+				if width > 0 {
+					list = append(list, fmt.Sprintf("%0*d", width, i))
+				} else {
+					list = append(list, fmt.Sprintf("%d", i))
+				}
+			}
+		} else {
+			for i := startVal; i >= endVal; i -= stepVal {
+				if width > 0 {
+					list = append(list, fmt.Sprintf("%0*d", width, i))
+				} else {
+					list = append(list, fmt.Sprintf("%d", i))
+				}
+			}
+		}
+		return list, nil
+	}
+
 	if wordlist != "" {
 		file, err := os.Open(wordlist)
 		if err != nil {
@@ -455,6 +579,7 @@ func GenerateJobs(engine *TemplateEngine, payloads1 []string, payloads2 []string
 
 func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, cancelChan <-chan bool) {
 	defer close(updateChan)
+	// Auto inject username/password markers if not present
 	InjectAutoMarkers(&config)
 
 	if config.Concurrency <= 0 {
@@ -486,6 +611,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		}
 	}
 
+	// 1. Load payload sets
 	payloads1, err := LoadPayloads(config.Wordlist, config.GenCharset, config.GenMaxLen)
 	if err != nil {
 		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: fmt.Sprintf("Error loading Payload Set 1: %v", err)}
@@ -498,6 +624,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		return
 	}
 
+	// 2. Build template engine
 	engine := NewTemplateEngine(config.TargetURL, config.Headers, config.OriginalBody)
 	if len(engine.Placeholders) == 0 {
 		updateChan <- AttackProgressMsg{Status: "Error", ErrorMsg: "No placeholders/markers (§) found in Target URL, Headers, or Request Body."}
@@ -567,6 +694,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		},
 	}
 
+	// Add default Content-Type headers if needed
 	if config.Headers == nil {
 		config.Headers = make(map[string]string)
 	}
@@ -600,6 +728,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 				var reqBody string
 
 				if job.isReset {
+					// rate limit bypass reset mechanism
 					resetPayload := make(map[int]string)
 					for j := range engine.Placeholders {
 						if j%2 == 0 {
@@ -694,7 +823,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 								if !strings.Contains(bodyStr, "incorrect") &&
 									!strings.Contains(bodyStr, "invalid") &&
 									!strings.Contains(bodyStr, "failed") &&
-									!strings.Contains(bodyStr, "hatal") {
+									!strings.Contains(bodyStr, "hatal") { // hatalı, hatali vs
 									res.success = true
 								}
 							}
@@ -710,7 +839,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 					}
 
 					success = true
-					break
+					break // Successfully processed (win or lose)
 				}
 
 				if !success && res.err == nil {
@@ -723,6 +852,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 				case results <- res:
 				}
 
+				// Delay logic with Jitter
 				if config.DelayMs > 0 {
 					jitter := 0
 					if config.DelayMs > 10 {
@@ -747,6 +877,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		}()
 	}
 
+	// Result collector with rate-limiting and block detection
 	var finalResult *attackResult
 	go func() {
 		lastUpdate := time.Now()
@@ -793,6 +924,7 @@ func RunBruteForceUI(config AttackConfig, updateChan chan<- AttackProgressMsg, c
 		done <- true
 	}()
 
+	// Start jobs generator
 	go func() {
 		defer close(jobs)
 		GenerateJobs(engine, payloads1, payloads2, config.AttackType, jobs, combinedCancel)
@@ -837,3 +969,5 @@ func RunBruteForce(config AttackConfig) {
 		}
 	}
 }
+
+
